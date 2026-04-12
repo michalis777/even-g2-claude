@@ -1,0 +1,14 @@
+{
+  "name": "even-g2-claude-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebSocket relay between Claude Code (tmux) and Even G2 glasses plugin",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "mock": "node server.js --stdin-mock"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Claude Code Monitor — Even G2</title>
+    <script>
+      // Relay configuration — injected before the plugin loads.
+      // For localhost PoC: token is read from the URL hash or defaults to empty.
+      // Usage: http://localhost:5173/#token=<your-relay-token>
+      //    or: set window.__RELAY_CONFIG__ directly in the console before load.
+      (function () {
+        // Try URL hash first: #token=abc123&url=ws://localhost:3000
+        const params = new URLSearchParams(location.hash.slice(1));
+        window.__RELAY_CONFIG__ = {
+          url:   params.get('url')   || 'ws://localhost:3000',
+          token: params.get('token') || '',
+        };
+        console.log('[config] Relay URL:', window.__RELAY_CONFIG__.url);
+        console.log('[config] Token set:', window.__RELAY_CONFIG__.token ? 'yes' : 'NO — pass #token=<value> in URL');
+      })();
+    </script>
+  </head>
+  <body>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

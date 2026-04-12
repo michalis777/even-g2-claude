@@ -1,0 +1,7 @@
+{
+  "name": "Claude Code Monitor",
+  "version": "0.1.0",
+  "description": "Monitor Claude Code sessions on Even G2 glasses",
+  "author": "Mike Kantartjis",
+  "entry": "dist/index.html"
+}
