@@ -71,6 +71,7 @@ claudecode-glasses/
 ├── README.md                         ← setup + usage instructions
 ├── relay-server/
 │   ├── server.js                     ← WebSocket relay (Node.js, no framework)
+│   ├── mock-feed.js                  ← automated test: feeds timed lines into relay stdin
 │   └── package.json                  ← single dependency: ws
 └── glasses-plugin/
     ├── src/
@@ -86,20 +87,23 @@ claudecode-glasses/
 
 ## Current State
 
-The codebase is complete for the PoC. Both files pass syntax/type checks. It has not yet been run against a live Even Hub simulator — that's the next step.
+First runtime test completed 2026-04-11 against the Even Hub simulator.
 
-**What works (designed, not yet runtime-tested):**
-- Full auth + session token issuance and storage
-- Session resume on reconnect
-- Automatic fallback to full auth on server restart / session expiry
-- tmux polling + approval pattern detection
-- Paginated display rendering via Even Hub SDK text containers
-- Swipe up/down (scroll), single tap (approve), double tap (reject/latest)
-- ANSI stripping, line truncation for display constraints
-- IP allowlist, auth timeout, auth failure banning
-- `--stdin-mock` mode for testing without tmux
+**Verified working (runtime-tested):**
+- Relay server starts in `--stdin-mock` mode and accepts WebSocket connections
+- Auth flow: master token → session UUID issuance works end-to-end
+- Session resume: plugin reconnects with saved session token, falls back to full auth on expiry
+- Terminal output streams from relay to plugin and renders on simulator display
+- Paginated display: text containers render correctly, pagination (pg 1/2, 2/2) works
+- Swipe up/down gestures navigate pages correctly in the simulator
+- Approval detection: relay correctly sets `approvalPending=true` when terminal output matches patterns (e.g. "Do you want to proceed? (y/n)")
+- `mock-feed.js` helper script for automated test sequences (feeds timed lines to relay stdin)
 
-**Not yet built (planned extensions discussed in session):**
+**Partially working / needs investigation:**
+- Click/double-click gestures: click fires an event but behavior unclear; double-click had no visible effect. Debug logging added to `main.ts` (`[event] raw:` lines) to diagnose on next test run. Likely an event shape mismatch between simulator and the expected `textEvent`/`sysEvent` paths.
+- Status bar does not visually switch to "!! APPROVE" state during testing — may be related to the click event issue or a rendering timing problem
+
+**Not yet built (planned extensions):**
 - Voice input via `bridge.audioControl` → speech-to-text → relay → tmux
 - Output summarization: call Claude API from within the plugin to compress long diffs before rendering
 - Multiple tmux session switching
@@ -156,8 +160,10 @@ node server.js --tmux-session claudecode --tmux-window 0
 
 ## Open Questions / Decisions for Next Session
 
-1. **Voice input priority** — is mic → speech-to-text → relay the next feature, or get the simulator PoC validated first?
-2. **Speech-to-text service** — Whisper local vs. a cloud API? Latency vs. privacy tradeoff given terminal output may contain sensitive data.
-3. **Approval pattern tuning** — the regex list in `server.js` (`APPROVAL_PATTERNS`) was written generically. Once tested against real Claude Code output, these will likely need adjustment.
-4. **Display font size** — 8 lines per page is an estimate at ~12px. Actual readable line count needs to be validated in the simulator.
-5. **Session TTL** — 30 days is the default. Adjust `CONFIG.sessionTtlMs` in `server.js` if tighter expiry is preferred.
+1. **Click/double-click event debugging** — top priority. Debug logging is in place (`main.ts` lines with `[event] raw:`). Open the simulator's DevTools console, click the buttons, and inspect the event shape. Likely fix: the simulator sends events on a path the code doesn't check (e.g. `appEvent` instead of `textEvent`/`sysEvent`), or the `eventType` enum values differ.
+2. **Approval status bar** — verify whether the "!! APPROVE" status text appears. The relay sends `approvalPending=true` correctly; check if the plugin receives it before the display re-renders.
+3. **Voice input priority** — is mic → speech-to-text → relay the next feature after click/approve works?
+4. **Speech-to-text service** — Whisper local vs. a cloud API? Latency vs. privacy tradeoff given terminal output may contain sensitive data.
+5. **Approval pattern tuning** — the regex list in `server.js` (`APPROVAL_PATTERNS`) was written generically. Once tested against real Claude Code output, these will likely need adjustment.
+6. **Display font size** — 8 lines per page at ~12px looked readable in the simulator, but needs validation on actual glasses hardware.
+7. **Session TTL** — 30 days is the default. Adjust `CONFIG.sessionTtlMs` in `server.js` if tighter expiry is preferred.

@@ -311,6 +311,8 @@ function sendToRelay(msg: object) {
 // ── Input ─────────────────────────────────────────────────────────────────────
 function setupInput() {
   bridge.onEvenHubEvent((event) => {
+    console.log('[event] raw:', JSON.stringify(event));
+
     // Events arrive on different paths depending on type:
     //   - scroll/click via text capture -> textEvent (with eventType)
     //   - double click -> sysEvent (with eventType=3)
@@ -319,12 +321,18 @@ function setupInput() {
     let type: OsEventTypeList | undefined;
     if (event.textEvent) {
       type = event.textEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
+      console.log('[event] textEvent, eventType=', event.textEvent.eventType, '→ type=', type);
     } else if (event.sysEvent) {
       type = event.sysEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
+      console.log('[event] sysEvent, eventType=', event.sysEvent.eventType, '→ type=', type);
+    } else {
+      console.log('[event] no textEvent or sysEvent — ignoring');
     }
 
     if (type === undefined || type === null) return;
     if (!authenticated) return;
+
+    console.log('[event] resolved type=', type, 'approvalPending=', approvalPending);
 
     switch (type) {
       case OsEventTypeList.SCROLL_TOP_EVENT:
