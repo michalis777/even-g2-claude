@@ -55,12 +55,17 @@ const RELAY_URL = validateUrl(RELAY_CONFIG.url);
 // Even Hub local storage key for the session token
 const SESSION_STORAGE_KEY = 'relay_session_token';
 
-const VISIBLE_LINES    = 8;
+// Aggressive layout: single full-display output container + invisible event
+// overlay. The status line lives as the first row of output text, and hints
+// (when needed) as the last row. Trades the "three-zone" visual structure
+// for ~+2 lines of extra terminal content.
+const VISIBLE_LINES    = 13;   // terminal content lines between the in-text
+                               // status row (top) and optional hints row (bottom)
+const LINE_CHAR_LIMIT  = 70;   // per-line char cap
 const DISPLAY_WIDTH    = 576;
+const DISPLAY_HEIGHT   = 288;
 
-const CONTAINER_STATUS = 1;
 const CONTAINER_OUTPUT = 2;
-const CONTAINER_HINTS  = 3;
 const CONTAINER_EVENTS = 4;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -128,7 +133,7 @@ function clampOffset(o: number): number {
   return Math.max(0, Math.min(o, maxOffset()));
 }
 
-function truncate(line: string, maxChars = 58): string {
+function truncate(line: string, maxChars = LINE_CHAR_LIMIT): string {
   return line.length <= maxChars ? line : line.slice(0, maxChars - 1) + '…';
 }
 
@@ -153,71 +158,59 @@ async function renderDisplay() {
   const isLatest   = scrollOffset >= maxOffset();
   const inChoice   = currentPrompt?.kind === 'choice';
 
+  // ── Status row (first line of the single output container) ──────────────
   let statusText: string;
-  if (!connected)       statusText = '○ CONNECTING...';
+  if (!connected)          statusText = '○ CONNECTING...';
   else if (!authenticated) statusText = '○ AUTH FAILED';
   else if (inChoice) {
     const p = currentPrompt as Extract<Prompt, { kind: 'choice' }>;
     statusText = `● CHOOSE  ${selectedChoiceIndex + 1}/${p.options.length}`;
   }
   else if (currentPrompt?.kind === 'yn') statusText = `● LIVE  !! APPROVE  ${topLine}-${bottomLine}/${allLines.length}`;
-  else                  statusText = `● LIVE  ${topLine}-${bottomLine}/${allLines.length}`;
+  else                                   statusText = `● LIVE  ${topLine}-${bottomLine}/${allLines.length}`;
 
-  const statusContainer = new TextContainerProperty({
-    xPosition: 0, yPosition: 0,
-    width: DISPLAY_WIDTH, height: 32,
-    borderWidth: 1,
-    borderColor: currentPrompt ? 15 : (authenticated ? 5 : 8),
-    paddingLength: 2,
-    containerID: CONTAINER_STATUS, containerName: 'status',
-    content: statusText,
-    isEventCapture: 0,
-  });
+  // ── Hints row (last line, only shown when actionable) ───────────────────
+  let hintsText = '';
+  if (!authenticated)                    hintsText = '';
+  else if (inChoice)                     hintsText = '[▲▼]=select  [tap]=confirm  [dbl]=cancel';
+  else if (currentPrompt?.kind === 'yn') hintsText = '[tap]=YES  [dbl]=NO  [▲▼]=scroll';
+  // scroll mode: no hints — reclaim the line for content.
 
-  let outputText: string;
-  if (!connected)          outputText = `Connecting...\n${RELAY_URL}`;
-  else if (!authenticated) outputText = 'Auth failed.\n\nCheck RELAY_TOKEN matches\nthe server.';
-  else if (inChoice) {
+  // ── Content body ─────────────────────────────────────────────────────────
+  let bodyText: string;
+  if (!connected) {
+    bodyText = `Connecting...\n${RELAY_URL}`;
+  } else if (!authenticated) {
+    bodyText = 'Auth failed.\n\nCheck RELAY_TOKEN matches\nthe server.';
+  } else if (inChoice) {
     const p = currentPrompt as Extract<Prompt, { kind: 'choice' }>;
     const header = p.question ? truncate(p.question) + '\n' : '';
     const optionLines = p.options.map((opt, i) => {
       const marker = i === selectedChoiceIndex ? '▶' : ' ';
       return truncate(`${marker} ${i + 1}. ${opt}`);
     });
-    outputText = header + optionLines.join('\n');
+    bodyText = header + optionLines.join('\n');
+  } else {
+    bodyText = lines.map(l => truncate(stripAnsi(l))).join('\n') || '(no output)';
   }
-  else                     outputText = lines.map(l => truncate(stripAnsi(l))).join('\n') || '(no output)';
+
+  // ── Compose single-container text: status + body + optional hints ───────
+  const outputText = [statusText, bodyText, hintsText].filter(s => s.length > 0).join('\n');
 
   const outputContainer = new TextContainerProperty({
-    xPosition: 0, yPosition: 34,
-    width: DISPLAY_WIDTH, height: 220,
-    borderWidth: 0, borderColor: 5, paddingLength: 4,
+    xPosition: 0, yPosition: 0,
+    width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT,
+    borderWidth: 0, borderColor: 5, paddingLength: 0,
     containerID: CONTAINER_OUTPUT, containerName: 'output',
     content: outputText,
     isEventCapture: 0,
   });
 
-  let hintsText: string;
-  if (!authenticated)                    hintsText = 'Not connected';
-  else if (inChoice)                     hintsText = '[▲▼]=select  [tap]=confirm  [dbl]=cancel';
-  else if (currentPrompt?.kind === 'yn') hintsText = '[tap]=YES  [dbl]=NO  [▲▼]=scroll';
-  else if (isLatest)                     hintsText = '[▲]=up   [dbl]=latest';
-  else                                   hintsText = '[▲]=up  [▼]=down  [dbl]=latest';
-
-  const hintsContainer = new TextContainerProperty({
-    xPosition: 0, yPosition: 256,
-    width: DISPLAY_WIDTH, height: 32,
-    borderWidth: 1, borderColor: 5, paddingLength: 2,
-    containerID: CONTAINER_HINTS, containerName: 'hints',
-    content: hintsText,
-    isEventCapture: 0,
-  });
-
-  // Invisible overlay that captures all input events without interfering
-  // with firmware scroll (which would swallow our scroll events)
+  // Invisible full-display overlay that captures input events without
+  // interfering with firmware scroll (which would swallow our scroll events)
   const eventsContainer = new TextContainerProperty({
-    xPosition: 0, yPosition: 34,
-    width: DISPLAY_WIDTH, height: 220,
+    xPosition: 0, yPosition: 0,
+    width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT,
     borderWidth: 0, borderColor: 0, paddingLength: 0,
     containerID: CONTAINER_EVENTS, containerName: 'events',
     content: ' ',
@@ -226,23 +219,15 @@ async function renderDisplay() {
 
   if (!pageCreated) {
     const result = await bridge.createStartUpPageContainer(new CreateStartUpPageContainer({
-      containerTotalNum: 4,
-      textObject: [statusContainer, outputContainer, hintsContainer, eventsContainer],
+      containerTotalNum: 2,
+      textObject: [outputContainer, eventsContainer],
     }));
     console.log('[display] createStartUpPageContainer result:', result);
     pageCreated = true;
   } else {
     await bridge.textContainerUpgrade(new TextContainerUpgrade({
-      containerID: CONTAINER_STATUS, containerName: 'status',
-      content: statusText, contentOffset: 0, contentLength: statusText.length,
-    }));
-    await bridge.textContainerUpgrade(new TextContainerUpgrade({
       containerID: CONTAINER_OUTPUT, containerName: 'output',
       content: outputText, contentOffset: 0, contentLength: outputText.length,
-    }));
-    await bridge.textContainerUpgrade(new TextContainerUpgrade({
-      containerID: CONTAINER_HINTS, containerName: 'hints',
-      content: hintsText, contentOffset: 0, contentLength: hintsText.length,
     }));
   }
 }
