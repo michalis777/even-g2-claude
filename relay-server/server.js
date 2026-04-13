@@ -62,7 +62,12 @@ const CONFIG = {
   sessionTtlMs:     30 * 24 * 60 * 60 * 1000, // 30 days
 };
 
-const ALLOWED_COMMANDS = new Set(['y', 'n']);
+// Command whitelist is now prompt-state-gated — see isCommandAllowed() below.
+// Base whitelist: y/n plus digits 1-9 (for numbered choice prompts).
+const BASE_ALLOWED_COMMANDS = new Set([
+  'y', 'n',
+  '1', '2', '3', '4', '5', '6', '7', '8', '9',
+]);
 
 // ── Session store (memory only — cleared on server restart) ───────────────────
 // Map of sessionToken -> { createdAt, lastSeenAt, ip }
@@ -100,20 +105,30 @@ function pruneExpiredSessions() {
 setInterval(pruneExpiredSessions, 60 * 60 * 1000);
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let outputBuffer    = [];
-let lastSentHash    = null;
-let approvalPending = false;
-const clients       = new Set();
-const authFailures  = new Map();
+let outputBuffer   = [];
+let lastSentHash   = null;
+// Structured prompt state replaces the old approvalPending boolean.
+// Shape: { kind: 'choice', options: string[], selectedIndex: number }
+//      | { kind: 'yn' }
+//      | null
+let currentPrompt  = null;
+const clients      = new Set();
+const authFailures = new Map();
 
-const APPROVAL_PATTERNS = [
-  /Do you want to proceed\?/i,
-  /Allow this action\?/i,
+// Legacy y/n fallback patterns. Modern Claude Code uses the numbered-choice
+// widget for everything, so these are unlikely to fire against real output —
+// retained as a defense against older Claude Code builds and other CLI tools.
+const YN_PATTERNS = [
   /\[y\/n\]/i,
   /\(y\/N\)/i,
+  /\(Y\/n\)/i,
   /Press Enter to continue/i,
-  /Approve|Reject/i,
 ];
+
+// Choice prompt parser anchors. See relay-server/samples/choice.txt for the
+// canonical format.
+const CHOICE_FOOTER_RE = /Esc to cancel/;
+const CHOICE_OPTION_RE = /^\s*(❯\s*)?(\d+)\.\s+(.+?)\s*$/;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function tokenValid(candidate) {
@@ -154,17 +169,86 @@ function captureTmux() {
   } catch { return null; }
 }
 
-function detectApproval(lines) {
-  return APPROVAL_PATTERNS.some(p => p.test(lines.slice(-5).join('\n')));
+// Scan the tail of the buffer for an active Claude Code confirmation widget.
+// Returns a structured Prompt object or null. Anchors on the footer
+// "Esc to cancel" line and walks upward collecting consecutive "N. text"
+// option lines; the ❯ marker identifies the currently-highlighted option.
+function detectPrompt(lines) {
+  const tail = lines.slice(-20);
+
+  let footerIdx = -1;
+  for (let i = tail.length - 1; i >= 0; i--) {
+    if (CHOICE_FOOTER_RE.test(tail[i])) { footerIdx = i; break; }
+  }
+
+  if (footerIdx !== -1) {
+    const rows = []; // collected bottom-up, reversed at the end
+    let question = null;
+    for (let i = footerIdx - 1; i >= 0; i--) {
+      const line = tail[i];
+      if (!line || !line.trim()) {
+        if (rows.length === 0) continue; // skip blank between footer and options
+        break;
+      }
+      const m = line.match(CHOICE_OPTION_RE);
+      if (m) {
+        const selected = !!m[1];
+        const text = m[3].replace(/\s*\(shift\+tab\)\s*$/, '').trim();
+        rows.push({ text, selected });
+      } else if (rows.length > 0) {
+        question = line.trim();
+        break; // non-option line above the options = the question line
+      }
+    }
+
+    if (rows.length >= 2) {
+      rows.reverse();
+      const selectedIdx = rows.findIndex(r => r.selected);
+      return {
+        kind: 'choice',
+        question,
+        options: rows.map(r => r.text),
+        selectedIndex: selectedIdx === -1 ? 0 : selectedIdx,
+      };
+    }
+  }
+
+  // Legacy y/n fallback
+  if (YN_PATTERNS.some(p => p.test(tail.slice(-5).join('\n')))) {
+    return { kind: 'yn' };
+  }
+
+  return null;
 }
 
 function simpleHash(lines) {
   return lines.slice(-20).join('|');
 }
 
-function sendToTmux(command) {
-  if (!ALLOWED_COMMANDS.has(command)) {
-    console.warn(`[security] Blocked disallowed command: "${command}"`);
+// Gate commands by the currently-active prompt. Even if the WebSocket is
+// compromised, the attacker can only send the specific selection the relay
+// itself has already parsed as valid.
+function isCommandAllowed(command, prompt) {
+  if (!BASE_ALLOWED_COMMANDS.has(command)) return false;
+
+  if (prompt?.kind === 'yn') {
+    return command === 'y' || command === 'n';
+  }
+
+  if (prompt?.kind === 'choice') {
+    const idx = parseInt(command, 10);
+    return Number.isInteger(idx) && idx >= 1 && idx <= prompt.options.length;
+  }
+
+  // No active prompt → nothing is allowed
+  return false;
+}
+
+function sendToTmux(command, prompt) {
+  if (!isCommandAllowed(command, prompt)) {
+    console.warn(
+      `[security] Blocked command "${command}" under prompt=${prompt?.kind ?? 'none'}`
+    );
     return false;
   }
   try {
@@ -180,14 +264,62 @@ function sendToTmux(command) {
   }
 }
 
+// Named keys reachable via `tmux send-keys`. Locked down to arrow-nav + Enter
+// because that's all Claude Code's confirmation widget needs. The plugin
+// cannot request arbitrary named keys — only the relay's own choice handler
+// constructs sequences from this set.
+const ALLOWED_KEYS = new Set(['Up', 'Down', 'Enter']);
+
+function sendKeysToTmux(keys) {
+  for (const k of keys) {
+    if (!ALLOWED_KEYS.has(k)) {
+      console.warn(`[security] Blocked key "${k}"`);
+      return false;
+    }
+  }
+  try {
+    const target = `${CONFIG.tmuxSession}:${CONFIG.tmuxWindow}`;
+    execSync(`tmux send-keys -t "${target}" ${keys.join(' ')}`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    console.log(`[tmux →] ${keys.join(' ')}`);
+    return true;
+  } catch (e) {
+    console.error('Failed to send keys to tmux:', e.message);
+    return false;
+  }
+}
+
+// For a 'choice' selection: compute the keystroke sequence that moves the
+// Claude Code cursor from its current position (parsed from the ❯ marker)
+// to the user's picked index, then presses Enter.
+function resolveChoice(targetIdx1Based, prompt) {
+  if (!prompt || prompt.kind !== 'choice') {
+    console.warn(`[security] resolveChoice with no active choice prompt`);
+    return false;
+  }
+  const total = prompt.options.length;
+  if (!Number.isInteger(targetIdx1Based) || targetIdx1Based < 1 || targetIdx1Based > total) {
+    console.warn(`[security] resolveChoice out-of-range index=${targetIdx1Based} total=${total}`);
+    return false;
+  }
+  const targetIdx = targetIdx1Based - 1;
+  const delta     = targetIdx - prompt.selectedIndex;
+  const keys      = [];
+  if (delta > 0) for (let i = 0; i < delta;  i++) keys.push('Down');
+  if (delta < 0) for (let i = 0; i < -delta; i++) keys.push('Up');
+  keys.push('Enter');
+  return sendKeysToTmux(keys);
+}
+
 // ── Send init payload to a newly authenticated socket ────────────────────────
 function sendInit(ws) {
   ws.send(JSON.stringify({
-    type:            'init',
-    lines:           outputBuffer,
-    approvalPending,
-    chunkSize:       CONFIG.chunkSize,
-    timestamp:       Date.now(),
+    type:      'init',
+    lines:     outputBuffer,
+    prompt:    currentPrompt,
+    chunkSize: CONFIG.chunkSize,
+    timestamp: Date.now(),
   }));
 }
 
@@ -199,7 +331,12 @@ function broadcast(msg) {
 }
 
 function broadcastBuffer() {
-  broadcast({ type: 'output', lines: outputBuffer, approvalPending, timestamp: Date.now() });
+  broadcast({
+    type:      'output',
+    lines:     outputBuffer,
+    prompt:    currentPrompt,
+    timestamp: Date.now(),
+  });
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
@@ -213,9 +350,9 @@ function startPolling() {
     if (!lines) return;
     const hash = simpleHash(lines);
     if (hash === lastSentHash) return;
-    lastSentHash    = hash;
-    outputBuffer    = lines.slice(-CONFIG.maxLines);
-    approvalPending = detectApproval(outputBuffer);
+    lastSentHash  = hash;
+    outputBuffer  = lines.slice(-CONFIG.maxLines);
+    currentPrompt = detectPrompt(outputBuffer);
     broadcastBuffer();
   }, CONFIG.pollIntervalMs);
 }
@@ -307,11 +444,44 @@ wss.on('connection', (ws, req) => {
 
     // ── Authenticated ────────────────────────────────────────────────────────
     switch (msg.type) {
-      case 'approve': sendToTmux('y'); break;
-      case 'reject':  sendToTmux('n'); break;
+      case 'approve':
+        // Legacy shortcut: approve = option 1 on a choice prompt, or 'y'
+        // on a legacy y/n prompt.
+        if (currentPrompt?.kind === 'yn') {
+          sendToTmux('y', currentPrompt);
+        } else if (currentPrompt?.kind === 'choice') {
+          resolveChoice(1, currentPrompt);
+        } else {
+          console.warn(`[security] 'approve' with no active prompt from ${ip}`);
+        }
+        break;
+
+      case 'reject':
+        // Legacy shortcut: reject = last option (conventionally "No" / cancel)
+        // on a choice prompt, or 'n' on a legacy y/n prompt.
+        if (currentPrompt?.kind === 'yn') {
+          sendToTmux('n', currentPrompt);
+        } else if (currentPrompt?.kind === 'choice') {
+          resolveChoice(currentPrompt.options.length, currentPrompt);
+        } else {
+          console.warn(`[security] 'reject' with no active prompt from ${ip}`);
+        }
+        break;
+
+      case 'choice': {
+        const idx = Number(msg.index);
+        if (!Number.isInteger(idx)) {
+          console.warn(`[security] 'choice' with non-integer index from ${ip}`);
+          break;
+        }
+        resolveChoice(idx, currentPrompt);
+        break;
+      }
+
       case 'ping':
         ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
         break;
+
       default:
         console.warn(`[security] Unknown type "${msg.type}" from ${ip}`);
     }
@@ -336,7 +506,7 @@ if (process.argv.includes('--stdin-mock')) {
   rl.on('line', (line) => {
     outputBuffer.push(line);
     if (outputBuffer.length > CONFIG.maxLines) outputBuffer.shift();
-    approvalPending = detectApproval(outputBuffer);
+    currentPrompt = detectPrompt(outputBuffer);
     broadcastBuffer();
   });
 }
@@ -355,7 +525,7 @@ console.log(`
 ╠══════════════════════════════════════════╣
 ║  tmux:     ${(CONFIG.tmuxSession + ':' + CONFIG.tmuxWindow).padEnd(30)}║
 ║  auth:     token → session (${Math.round(CONFIG.sessionTtlMs / 86400000)}d TTL)   ║
-║  commands: whitelist only (y, n)         ║
+║  commands: prompt-gated (y/n + 1-9)      ║
 ╚══════════════════════════════════════════╝
 ${ipNote}
 `);

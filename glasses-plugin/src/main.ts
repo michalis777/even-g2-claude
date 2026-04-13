@@ -63,10 +63,17 @@ const CONTAINER_OUTPUT = 2;
 const CONTAINER_HINTS  = 3;
 const CONTAINER_EVENTS = 4;
 
+// ── Types ─────────────────────────────────────────────────────────────────────
+// Mirrors the Prompt shape the relay sends. See relay-server/server.js detectPrompt().
+type Prompt =
+  | { kind: 'yn' }
+  | { kind: 'choice'; question: string | null; options: string[]; selectedIndex: number };
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let allLines:       string[]      = [];
 let scrollOffset                  = 0;  // index of top visible line
-let approvalPending               = false;
+let currentPrompt:  Prompt | null = null;
+let selectedChoiceIndex           = 0;  // local cursor; seeded from prompt.selectedIndex
 let connected                     = false;
 let authenticated                 = false;
 let ws:             WebSocket | null = null;
@@ -130,23 +137,37 @@ function stripAnsi(str: string): string {
   return str.replace(/\x1B\[[0-9;]*[mGKHF]/g, '');
 }
 
+// Identity key for a Prompt, used to detect "same prompt" across polls so we
+// don't clobber the user's local cursor selection every 500ms when the server
+// re-broadcasts the same prompt.
+function promptKey(p: Prompt | null): string {
+  if (!p) return 'none';
+  if (p.kind === 'yn') return 'yn';
+  return `choice:${p.options.join('|')}`;
+}
+
 async function renderDisplay() {
   const lines      = visibleLines(scrollOffset);
   const topLine    = allLines.length === 0 ? 0 : scrollOffset + 1;
   const bottomLine = Math.min(allLines.length, scrollOffset + VISIBLE_LINES);
   const isLatest   = scrollOffset >= maxOffset();
+  const inChoice   = currentPrompt?.kind === 'choice';
 
   let statusText: string;
   if (!connected)       statusText = '○ CONNECTING...';
   else if (!authenticated) statusText = '○ AUTH FAILED';
-  else if (approvalPending) statusText = `● LIVE  !! APPROVE  ${topLine}-${bottomLine}/${allLines.length}`;
+  else if (inChoice) {
+    const p = currentPrompt as Extract<Prompt, { kind: 'choice' }>;
+    statusText = `● CHOOSE  ${selectedChoiceIndex + 1}/${p.options.length}`;
+  }
+  else if (currentPrompt?.kind === 'yn') statusText = `● LIVE  !! APPROVE  ${topLine}-${bottomLine}/${allLines.length}`;
   else                  statusText = `● LIVE  ${topLine}-${bottomLine}/${allLines.length}`;
 
   const statusContainer = new TextContainerProperty({
     xPosition: 0, yPosition: 0,
     width: DISPLAY_WIDTH, height: 32,
     borderWidth: 1,
-    borderColor: approvalPending ? 15 : (authenticated ? 5 : 8),
+    borderColor: currentPrompt ? 15 : (authenticated ? 5 : 8),
     paddingLength: 2,
     containerID: CONTAINER_STATUS, containerName: 'status',
     content: statusText,
@@ -156,6 +177,15 @@ async function renderDisplay() {
   let outputText: string;
   if (!connected)          outputText = `Connecting...\n${RELAY_URL}`;
   else if (!authenticated) outputText = 'Auth failed.\n\nCheck RELAY_TOKEN matches\nthe server.';
+  else if (inChoice) {
+    const p = currentPrompt as Extract<Prompt, { kind: 'choice' }>;
+    const header = p.question ? truncate(p.question) + '\n' : '';
+    const optionLines = p.options.map((opt, i) => {
+      const marker = i === selectedChoiceIndex ? '▶' : ' ';
+      return truncate(`${marker} ${i + 1}. ${opt}`);
+    });
+    outputText = header + optionLines.join('\n');
+  }
   else                     outputText = lines.map(l => truncate(stripAnsi(l))).join('\n') || '(no output)';
 
   const outputContainer = new TextContainerProperty({
@@ -168,10 +198,11 @@ async function renderDisplay() {
   });
 
   let hintsText: string;
-  if (!authenticated)       hintsText = 'Not connected';
-  else if (approvalPending) hintsText = '[tap]=YES  [dbl]=NO  [▲▼]=scroll';
-  else if (isLatest)        hintsText = '[▲]=up   [dbl]=latest';
-  else                      hintsText = '[▲]=up  [▼]=down  [dbl]=latest';
+  if (!authenticated)                    hintsText = 'Not connected';
+  else if (inChoice)                     hintsText = '[▲▼]=select  [tap]=confirm  [dbl]=cancel';
+  else if (currentPrompt?.kind === 'yn') hintsText = '[tap]=YES  [dbl]=NO  [▲▼]=scroll';
+  else if (isLatest)                     hintsText = '[▲]=up   [dbl]=latest';
+  else                                   hintsText = '[▲]=up  [▼]=down  [dbl]=latest';
 
   const hintsContainer = new TextContainerProperty({
     xPosition: 0, yPosition: 256,
@@ -275,8 +306,16 @@ async function connectRelay(url: string) {
         }
 
         const wasLatest = scrollOffset >= maxOffset();
+        const prevPromptKey = promptKey(currentPrompt);
         allLines = (msg.lines as string[]).filter(l => l.trim().length > 0);
-        approvalPending = msg.approvalPending ?? false;
+        currentPrompt = (msg.prompt ?? null) as Prompt | null;
+
+        // Seed the local cursor from the server's parsed selection whenever
+        // a new choice prompt appears (new prompt, or options changed).
+        const newPromptKey = promptKey(currentPrompt);
+        if (currentPrompt?.kind === 'choice' && newPromptKey !== prevPromptKey) {
+          selectedChoiceIndex = currentPrompt.selectedIndex;
+        }
 
         if (wasLatest || msg.type === 'init') {
           scrollOffset = maxOffset();
@@ -314,54 +353,84 @@ function sendToRelay(msg: object) {
 // ── Input ─────────────────────────────────────────────────────────────────────
 function setupInput() {
   bridge.onEvenHubEvent((event) => {
-    console.log('[event] raw:', JSON.stringify(event));
+    // ── Event dispatch ──
+    // The SDK has 4 typed paths (listEvent / textEvent / sysEvent / audioEvent)
+    // plus a raw jsonData fallback for hosts that don't use the typed PB model.
+    // CLICK_EVENT has enum value 0, which protobuf strips as a default — so when
+    // eventType is missing on any of these paths we assume CLICK_EVENT.
+    const anyEvent = event as any;
+    const rawJson  = anyEvent.jsonData;
+    let   type:      OsEventTypeList | undefined;
+    let   source:    string = 'none';
 
-    // Events arrive on different paths depending on type:
-    //   - scroll/click via text capture -> textEvent (with eventType)
-    //   - double click -> sysEvent (with eventType=3)
-    //   - click -> sysEvent (eventType=0, stripped by protobuf as default)
-    // So: CLICK_EVENT=0 gets omitted. Default to CLICK_EVENT when eventType is missing.
-    let type: OsEventTypeList | undefined;
-    if (event.textEvent) {
-      type = event.textEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
-      console.log('[event] textEvent, eventType=', event.textEvent.eventType, '→ type=', type);
+    if (event.listEvent) {
+      type   = event.listEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
+      source = 'listEvent';
+    } else if (event.textEvent) {
+      type   = event.textEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
+      source = 'textEvent';
     } else if (event.sysEvent) {
-      type = event.sysEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
-      console.log('[event] sysEvent, eventType=', event.sysEvent.eventType, '→ type=', type);
-    } else {
-      console.log('[event] no textEvent or sysEvent — ignoring');
+      type   = event.sysEvent.eventType ?? OsEventTypeList.CLICK_EVENT;
+      source = 'sysEvent';
+    } else if (rawJson && typeof rawJson === 'object') {
+      // Host sent a raw dict — look for an eventType-ish field
+      const rawType = rawJson.eventType ?? rawJson.event_type ?? rawJson.Event_Type;
+      if (rawType !== undefined) {
+        type   = typeof rawType === 'number' ? rawType : OsEventTypeList.CLICK_EVENT;
+        source = 'jsonData';
+      }
     }
+
+    console.log('[event]', source, 'type=', type);
 
     if (type === undefined || type === null) return;
     if (!authenticated) return;
 
-    console.log('[event] resolved type=', type, 'approvalPending=', approvalPending);
+    const inChoice = currentPrompt?.kind === 'choice';
 
     switch (type) {
       case OsEventTypeList.SCROLL_TOP_EVENT:
-        scrollOffset = clampOffset(scrollOffset - 1);
+        if (inChoice) {
+          selectedChoiceIndex = Math.max(0, selectedChoiceIndex - 1);
+        } else {
+          scrollOffset = clampOffset(scrollOffset - 1);
+        }
         renderDisplay();
         break;
 
       case OsEventTypeList.SCROLL_BOTTOM_EVENT:
-        scrollOffset = clampOffset(scrollOffset + 1);
+        if (inChoice) {
+          const p = currentPrompt as Extract<Prompt, { kind: 'choice' }>;
+          selectedChoiceIndex = Math.min(p.options.length - 1, selectedChoiceIndex + 1);
+        } else {
+          scrollOffset = clampOffset(scrollOffset + 1);
+        }
         renderDisplay();
         break;
 
       case OsEventTypeList.CLICK_EVENT:
-        if (approvalPending) {
+        if (inChoice) {
+          sendToRelay({ type: 'choice', index: selectedChoiceIndex + 1 });
+          // Don't clear locally — wait for the server's next broadcast to
+          // show the prompt has been resolved (outputBuffer will no longer
+          // contain the widget).
+        } else if (currentPrompt?.kind === 'yn') {
           sendToRelay({ type: 'approve' });
-          approvalPending = false;
-          renderDisplay();
         }
         break;
 
       case OsEventTypeList.DOUBLE_CLICK_EVENT:
-        if (approvalPending) {
+        if (inChoice) {
+          // Local cancel: stop showing the choice UI on the glasses. The
+          // server still has the prompt active until the user resolves it
+          // elsewhere (e.g. Esc in the actual terminal).
+          currentPrompt = null;
+          scrollOffset = maxOffset();
+        } else if (currentPrompt?.kind === 'yn') {
           sendToRelay({ type: 'reject' });
-          approvalPending = false;
+        } else {
+          scrollOffset = maxOffset();
         }
-        scrollOffset = maxOffset();
         renderDisplay();
         break;
     }

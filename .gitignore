@@ -3,3 +3,7 @@ dist/
 .vite/
 *.log
 .DS_Store
+
+# Test artifacts from simulator runs
+glasses_*.png
+/hello*.txt
