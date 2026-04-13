@@ -8,27 +8,27 @@ Project created on: 2026-04-11
 
 A proof-of-concept that enables monitoring and interaction with Claude Code terminal sessions on **Even Realities G2 smart glasses** — without needing the physical hardware to develop and test. The Even Hub simulator covers the full development loop.
 
-The use case is **monitor + selective read, with occasional steering** — not a full terminal replacement. You glance at what Claude Code is doing, scroll through output, and tap to approve/reject prompts. Voice input is a planned extension for anything beyond y/n.
+The use case is **monitor + selective read, with occasional steering** — not a full terminal replacement. You glance at what Claude Code is doing, scroll line-by-line through output, and resolve Claude's confirmation dialogs — including the multi-option numbered widgets Claude Code uses for every approval — right from the glasses. Voice input for free-form text prompts is a planned Phase 3 extension.
 
 ## Architecture
 
 ```
-┌─────────────────┐        WebSocket        ┌──────────────────────┐
-│  Claude Code    │──── relay-server ───────►│  Even Hub Plugin     │
-│  (tmux on PC)   │◄── y/n only ─────────────│  (phone WebView)     │
-└─────────────────┘                          └──────────┬───────────┘
-                                                        │ Even Hub SDK
-                                                        ▼
-                                             ┌──────────────────────┐
-                                             │  G2 Glasses Display  │
-                                             │  576×288 greyscale   │
-                                             └──────────────────────┘
+┌─────────────────┐         WebSocket         ┌──────────────────────┐
+│  Claude Code    │───── relay-server ───────►│  Even Hub Plugin     │
+│  (tmux on PC)   │◄── prompt-gated keys ─────│  (phone WebView)     │
+└─────────────────┘                           └──────────┬───────────┘
+                                                         │ Even Hub SDK
+                                                         ▼
+                                              ┌──────────────────────┐
+                                              │  G2 Glasses Display  │
+                                              │  576×288 greyscale   │
+                                              └──────────────────────┘
 ```
 
 ### Components
 
-- **Relay server** (`scripts/server.js`) — Node.js WebSocket server running on your PC. Polls Claude Code's tmux session via `tmux capture-pane`, detects approval prompts via regex, and serves output to the plugin. Accepts only `y` and `n` back.
-- **Glasses plugin** (`scripts/main.ts`) — Even Hub SDK TypeScript app running in a WebView on the phone. Connects to the relay, paginates terminal output into 8-line pages across the 576×288 display, maps touchpad gestures to scroll/approve/reject.
+- **Relay server** (`relay-server/server.js`) — Node.js WebSocket server running on your PC. Polls Claude Code's tmux session via `tmux capture-pane`, parses the output into a structured `Prompt` object, and serves it to the plugin. The command surface back to tmux is **prompt-state-gated**: y/n reach tmux only when a yn prompt is active, and arrow-key navigation (`Up`/`Down`/`Enter`) only when a choice prompt is active.
+- **Glasses plugin** (`glasses-plugin/src/main.ts`) — Even Hub SDK TypeScript app running in a WebView on the phone. Connects to the relay, renders terminal output line-by-line across the 576×288 display. Two modes: **scroll** (no active prompt — scroll ▲▼ moves viewport one line, double-tap jumps to latest) and **choice** (choice prompt active — scroll ▲▼ moves the selection cursor, tap confirms, double-tap cancels locally).
 
 ## Project Lead
 - **Mike Kantartjis** — AI&I Team (personal project / innovation exploration)
@@ -36,7 +36,8 @@ The use case is **monitor + selective read, with occasional steering** — not a
 ## Key Design Decisions
 
 - **tmux capture-pane** for session tailing — cleanest non-invasive approach
-- **y/n only command surface** — intentionally minimal blast radius if relay WebSocket is compromised
+- **Prompt-state-gated command surface** — the relay parses live terminal output into a structured `Prompt` object and only allows the specific keystrokes that resolve *that* prompt at *that* moment. A compromised WebSocket can at most resolve whatever dialog is currently on screen, never inject arbitrary commands.
+- **Arrow-key navigation for choice prompts** — Claude Code's confirmation widgets use arrow keys + Enter, not digit-typing. The relay computes the `Up`/`Down` delta from the real cursor position (parsed from the `❯` marker) to the user's pick.
 - **Session tokens** — master token sent once, then UUID session tokens for reconnects (30-day TTL)
 - **Tailscale preferred** over ngrok — private VPN, no public surface
 
@@ -47,12 +48,12 @@ The use case is **monitor + selective read, with occasional steering** — not a
 | Authentication | Master token → session UUID; stored in glasses local storage |
 | Reconnects | Session token only — master token not retransmitted |
 | Brute force | IP banned after 3 failed token attempts |
-| Command surface | Only `y` and `n` ever reach tmux |
+| Command surface | Prompt-state-gated: y/n only on yn prompts, `Up`/`Down`/`Enter` only on choice prompts with in-range arrow counts |
 | Transport | `wss://` enforced for non-localhost; Tailscale preferred |
 
 ## Current State
 
-PoC codebase is complete (designed, not yet runtime-tested). Both files pass syntax/type checks. Next step is running against the Even Hub simulator.
+**Phase 2 complete (2026-04-12):** Verified end-to-end against real Claude Code in the Even Hub simulator. Scroll, numbered-choice rendering, arrow-key resolution of confirmation dialogs, and the prompt-state-gated whitelist all work. Voice input for free-form text prompts is the Phase 3 extension (deferred).
 
 ## Running the PoC (Simulator)
 
@@ -74,17 +75,17 @@ npx @evenrealities/evenhub-simulator http://localhost:5173
 
 ## Planned Extensions
 
-- [ ] Voice input via `bridge.audioControl` → speech-to-text → relay → tmux
-- [ ] Output summarization: Claude API from within plugin to compress long diffs
+- [ ] **Phase 3 — voice input** for free-form text prompts via the phone WebView's Web Speech API → relay → tmux. Trigger gesture TBD; will be designed after living with Phase 2 for a bit.
+- [ ] Output summarization: Claude API from within the plugin to compress long diffs
 - [ ] Multiple tmux session switching
-- [ ] Structured approval events from Claude Code (vs regex detection)
+- [ ] Structured approval events emitted directly by Claude Code (vs parsing them out of rendered tmux output)
 
 ## Structure
 
-- `scripts/` — Source code (relay server + glasses plugin)
-- `reference/` — SDK documentation and external references
-- `notes/` — Working notes and session logs
-- `HANDOFF.md` — Original session handoff document
+- `relay-server/` — Node.js WebSocket relay (`server.js` holds all logic; `samples/` contains raw tmux captures used as parser fixtures)
+- `glasses-plugin/` — Even Hub SDK plugin, TypeScript + Vite (`src/main.ts` holds all logic)
+- `HANDOFF.md` — Detailed design context, key decisions, and open questions
+- `CLAUDE.md` — Guidance for Claude Code when editing this repo
 
 ## Related Links
 
