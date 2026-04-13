@@ -55,7 +55,7 @@ const RELAY_URL = validateUrl(RELAY_CONFIG.url);
 // Even Hub local storage key for the session token
 const SESSION_STORAGE_KEY = 'relay_session_token';
 
-const LINES_PER_PAGE   = 8;
+const VISIBLE_LINES    = 8;
 const DISPLAY_WIDTH    = 576;
 
 const CONTAINER_STATUS = 1;
@@ -65,7 +65,7 @@ const CONTAINER_EVENTS = 4;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let allLines:       string[]      = [];
-let currentPage                   = 0;
+let scrollOffset                  = 0;  // index of top visible line
 let approvalPending               = false;
 let connected                     = false;
 let authenticated                 = false;
@@ -109,16 +109,16 @@ async function clearSession() {
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
-function totalPages(): number {
-  return Math.max(1, Math.ceil(allLines.length / LINES_PER_PAGE));
+function maxOffset(): number {
+  return Math.max(0, allLines.length - VISIBLE_LINES);
 }
 
-function pageLines(page: number): string[] {
-  return allLines.slice(page * LINES_PER_PAGE, page * LINES_PER_PAGE + LINES_PER_PAGE);
+function visibleLines(offset: number): string[] {
+  return allLines.slice(offset, offset + VISIBLE_LINES);
 }
 
-function clampPage(p: number): number {
-  return Math.max(0, Math.min(p, totalPages() - 1));
+function clampOffset(o: number): number {
+  return Math.max(0, Math.min(o, maxOffset()));
 }
 
 function truncate(line: string, maxChars = 58): string {
@@ -131,15 +131,16 @@ function stripAnsi(str: string): string {
 }
 
 async function renderDisplay() {
-  const pages    = totalPages();
-  const lines    = pageLines(currentPage);
-  const isLatest = currentPage === pages - 1;
+  const lines      = visibleLines(scrollOffset);
+  const topLine    = allLines.length === 0 ? 0 : scrollOffset + 1;
+  const bottomLine = Math.min(allLines.length, scrollOffset + VISIBLE_LINES);
+  const isLatest   = scrollOffset >= maxOffset();
 
   let statusText: string;
   if (!connected)       statusText = '○ CONNECTING...';
   else if (!authenticated) statusText = '○ AUTH FAILED';
-  else if (approvalPending) statusText = `● LIVE  !! APPROVE  pg ${currentPage + 1}/${pages}`;
-  else                  statusText = `● LIVE  pg ${currentPage + 1}/${pages}`;
+  else if (approvalPending) statusText = `● LIVE  !! APPROVE  ${topLine}-${bottomLine}/${allLines.length}`;
+  else                  statusText = `● LIVE  ${topLine}-${bottomLine}/${allLines.length}`;
 
   const statusContainer = new TextContainerProperty({
     xPosition: 0, yPosition: 0,
@@ -169,8 +170,8 @@ async function renderDisplay() {
   let hintsText: string;
   if (!authenticated)       hintsText = 'Not connected';
   else if (approvalPending) hintsText = '[tap]=YES  [dbl]=NO  [▲▼]=scroll';
-  else if (isLatest)        hintsText = '[▲]=prev page   [dbl]=latest';
-  else                      hintsText = '[▲]=prev  [▼]=next  [dbl]=latest';
+  else if (isLatest)        hintsText = '[▲]=up   [dbl]=latest';
+  else                      hintsText = '[▲]=up  [▼]=down  [dbl]=latest';
 
   const hintsContainer = new TextContainerProperty({
     xPosition: 0, yPosition: 256,
@@ -273,12 +274,14 @@ async function connectRelay(url: string) {
           console.log('[auth] Authenticated');
         }
 
+        const wasLatest = scrollOffset >= maxOffset();
         allLines = (msg.lines as string[]).filter(l => l.trim().length > 0);
         approvalPending = msg.approvalPending ?? false;
 
-        const wasLatest = currentPage === totalPages() - 1;
         if (wasLatest || msg.type === 'init') {
-          currentPage = clampPage(totalPages() - 1);
+          scrollOffset = maxOffset();
+        } else {
+          scrollOffset = clampOffset(scrollOffset);
         }
 
         renderDisplay();
@@ -336,12 +339,12 @@ function setupInput() {
 
     switch (type) {
       case OsEventTypeList.SCROLL_TOP_EVENT:
-        currentPage = clampPage(currentPage - 1);
+        scrollOffset = clampOffset(scrollOffset - 1);
         renderDisplay();
         break;
 
       case OsEventTypeList.SCROLL_BOTTOM_EVENT:
-        if (currentPage + 1 < totalPages()) currentPage = clampPage(currentPage + 1);
+        scrollOffset = clampOffset(scrollOffset + 1);
         renderDisplay();
         break;
 
@@ -358,7 +361,7 @@ function setupInput() {
           sendToRelay({ type: 'reject' });
           approvalPending = false;
         }
-        currentPage = clampPage(totalPages() - 1);
+        scrollOffset = maxOffset();
         renderDisplay();
         break;
     }
