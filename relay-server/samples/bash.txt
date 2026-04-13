@@ -1,0 +1,23 @@
+ ▐▛███▜▌   Claude Code v2.1.104
+▝▜█████▛▘  Opus 4.6 (1M context) · Claude Max
+  ▘▘ ▝▝    ~/Documents/dikaMou/even-g2-claude
+
+❯ create a file called hello.txt
+    with the content 'hi'
+
+⏺ Write(hello.txt)
+  ⎿  User rejected write to hello.txt
+      1 hi
+
+❯ run ls /tmp
+
+  Listed 1 directory (ctrl+o to expand)
+
+────────────────────────────────────────────────────────────────────────────────
+❯ run ls /tmp
+────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
