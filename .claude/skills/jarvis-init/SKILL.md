@@ -71,18 +71,28 @@ Bootstrap the full Even G2 Claude dev environment so the user can interact with 
    ps aux | grep -E "evenhub-simulator" | grep -v grep | awk '{print $2}' | head -1
    ```
 
+8. **Open an input terminal.** Pop a new Terminal.app window already attached to the tmux session so the user has somewhere to type new requests to Claude Code. Without this step the inner claude is running but the user has nowhere to interact with it — they'd have to manually open a terminal and type `tmux attach -t claudecode` themselves. Skip this step if verification in step 7 showed any failures.
+
+   ```bash
+   osascript -e 'tell application "Terminal" to do script "tmux attach -t claudecode"' -e 'tell application "Terminal" to activate'
+   ```
+
+   Running the skill multiple times will open multiple Terminal windows — that's fine, the extra ones just attach to the same tmux session and can be closed without affecting anything.
+
 ## Final report
 
 Post a single status block like this. Keep it short:
 
 ```
-✅ tmux claudecode          (attach: tmux attach -t claudecode)
+✅ tmux claudecode          (inner claude running)
 ✅ relay-server             (ws://localhost:3000, task <bg-id>)
 ✅ vite dev server          (http://localhost:5173)
 ✅ Even Hub simulator       (task <bg-id>)
+✅ Terminal window opened   (attached to claudecode)
 
-Ready. Drive Claude Code with:  tmux attach -t claudecode
-(Detach with Ctrl-b d. The relay polls tmux independently of your attachment.)
+Ready. Type new requests in the new Terminal window.
+Watch output + resolve prompts on the glasses simulator.
+(Detach the Terminal with Ctrl-b d — the relay polls tmux independently.)
 ```
 
 Mark any failed component with ❌ and put the error underneath, indented. Do not offer to fix — leave that to the user's next message.
