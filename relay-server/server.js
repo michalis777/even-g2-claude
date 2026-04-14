@@ -216,27 +216,40 @@ function detectPrompt(lines) {
   }
 
   if (footerIdx !== -1) {
-    const rows = []; // collected bottom-up, reversed at the end
-    let question = null;
+    // Walk upward from the footer, collecting every non-blank line into a raw
+    // buffer until we hit a blank (which separates the widget from prior
+    // output). Leading blanks between footer and first option are skipped.
+    const raw = [];
     for (let i = footerIdx - 1; i >= 0; i--) {
       const line = tail[i];
       if (!line || !line.trim()) {
-        if (rows.length === 0) continue; // skip blank between footer and options
+        if (raw.length === 0) continue;
         break;
       }
+      raw.push(line);
+    }
+    raw.reverse(); // now top-down: [question?, opt1, opt1-cont?, opt2, ...]
+
+    // Parse top-down. A line that matches CHOICE_OPTION_RE starts a new
+    // option; a non-matching line either extends the previous option (Claude
+    // Code wraps long option text onto indented continuation rows at narrow
+    // tmux widths) or, if no option has been seen yet, is the question line.
+    const rows = [];
+    let question = null;
+    for (const line of raw) {
       const m = line.match(CHOICE_OPTION_RE);
       if (m) {
         const selected = !!m[1];
         const text = m[3].replace(/\s*\(shift\+tab\)\s*$/, '').trim();
         rows.push({ text, selected });
       } else if (rows.length > 0) {
+        rows[rows.length - 1].text += ' ' + line.trim();
+      } else if (question === null) {
         question = line.trim();
-        break; // non-option line above the options = the question line
       }
     }
 
     if (rows.length >= 2) {
-      rows.reverse();
       const selectedIdx = rows.findIndex(r => r.selected);
       return {
         kind: 'choice',

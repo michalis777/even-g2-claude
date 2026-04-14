@@ -35,8 +35,10 @@ Bootstrap the full Even G2 Claude dev environment so the user can interact with 
 
 3. **Tmux + Claude Code.** Create a detached tmux session named `claudecode` and launch `claude` inside it. The user attaches separately. The `sleep 0.5` is deliberate — it gives the freshly-spawned zsh enough time to finish initializing before `send-keys` fires, otherwise the keystrokes can race the shell startup and get lost.
 
+   **Width is pinned to `LINE_CHAR_LIMIT`** (`glasses-plugin/src/main.ts`). Matching tmux columns to glasses columns means Claude Code wraps once, server-side, at exactly the column the plugin displays — no double-wrap, no `wrapLine` reformatting of already-wrapped rows. Terminal is cramped at 70 cols (Claude's banner clips), which is the known trade-off of option 2. If you change `LINE_CHAR_LIMIT`, change this `-x` too.
+
    ```bash
-   tmux new-session -d -s claudecode -x 120 -y 30
+   tmux new-session -d -s claudecode -x 70 -y 30
    sleep 0.5
    tmux send-keys -t claudecode "cd /Users/Mike.Kantartjis/Documents/dikaMou/even-g2-claude && claude" Enter
    ```

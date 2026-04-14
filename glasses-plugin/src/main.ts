@@ -79,6 +79,12 @@ let allLines:       string[]      = [];
 let scrollOffset                  = 0;  // index of top visible line
 let currentPrompt:  Prompt | null = null;
 let selectedChoiceIndex           = 0;  // local cursor; seeded from prompt.selectedIndex
+// When the user double-taps to dismiss a choice prompt, we stash its key here
+// instead of nulling currentPrompt. While this matches promptKey(currentPrompt),
+// the renderer treats the active prompt as "hidden" and shows scroll mode; a
+// subsequent double-tap un-dismisses it. Any new prompt from the relay (a
+// different key) clears the dismissal automatically so we never swallow one.
+let dismissedPromptKey: string    = 'none';
 let connected                     = false;
 let authenticated                 = false;
 let ws:             WebSocket | null = null;
@@ -242,7 +248,9 @@ async function renderDisplay() {
   const topLine    = allLines.length === 0 ? 0 : scrollOffset + 1;
   const bottomLine = Math.min(allLines.length, scrollOffset + VISIBLE_LINES);
   const isLatest   = scrollOffset >= maxOffset();
-  const inChoice   = currentPrompt?.kind === 'choice';
+  const hasChoice  = currentPrompt?.kind === 'choice';
+  const isDismissed = hasChoice && promptKey(currentPrompt) === dismissedPromptKey;
+  const inChoice   = hasChoice && !isDismissed;
 
   // ── Status row (first line of the single output container) ──────────────
   let statusText: string;
@@ -258,7 +266,8 @@ async function renderDisplay() {
   // ── Hints row (last line, only shown when actionable) ───────────────────
   let hintsText = '';
   if (!authenticated)                    hintsText = '';
-  else if (inChoice)                     hintsText = '[▲▼]=select  [tap]=confirm  [dbl]=cancel';
+  else if (inChoice)                     hintsText = '[▲▼]=select  [tap]=confirm  [dbl]=hide';
+  else if (isDismissed)                  hintsText = '[dbl]=show choice  [▲▼]=scroll';
   else if (currentPrompt?.kind === 'yn') hintsText = '[tap]=YES  [dbl]=NO  [▲▼]=scroll';
   // scroll mode: no hints — reclaim the line for content.
 
@@ -415,6 +424,14 @@ async function connectRelay(url: string) {
           selectedChoiceIndex = currentPrompt.selectedIndex;
         }
 
+        // A user-dismissed prompt stays dismissed only while the same prompt
+        // key is still active on the server. Any change — prompt resolved
+        // (→ 'none') or a different prompt replacing it — clears the flag so
+        // we don't accidentally swallow a fresh prompt.
+        if (newPromptKey !== dismissedPromptKey) {
+          dismissedPromptKey = 'none';
+        }
+
         if (wasLatest || msg.type === 'init') {
           scrollOffset = maxOffset();
         } else {
@@ -484,7 +501,11 @@ function setupInput() {
     if (type === undefined || type === null) return;
     if (!authenticated) return;
 
-    const inChoice = currentPrompt?.kind === 'choice';
+    // Local inChoice mirrors the renderer: an active-but-dismissed prompt
+    // behaves like scroll mode until the user double-taps to un-dismiss it.
+    const hasChoice = currentPrompt?.kind === 'choice';
+    const isDismissed = hasChoice && promptKey(currentPrompt) === dismissedPromptKey;
+    const inChoice = hasChoice && !isDismissed;
 
     switch (type) {
       case OsEventTypeList.SCROLL_TOP_EVENT:
@@ -519,11 +540,17 @@ function setupInput() {
 
       case OsEventTypeList.DOUBLE_CLICK_EVENT:
         if (inChoice) {
-          // Local cancel: stop showing the choice UI on the glasses. The
-          // server still has the prompt active until the user resolves it
-          // elsewhere (e.g. Esc in the actual terminal).
-          currentPrompt = null;
+          // Dismiss the choice UI locally so the user can scroll terminal
+          // context. The server still has the prompt active; re-show it with
+          // another double-tap from scroll mode.
+          dismissedPromptKey = promptKey(currentPrompt);
           scrollOffset = maxOffset();
+        } else if (isDismissed) {
+          // Un-dismiss: bring the choice UI back and reseed the cursor.
+          dismissedPromptKey = 'none';
+          if (currentPrompt?.kind === 'choice') {
+            selectedChoiceIndex = currentPrompt.selectedIndex;
+          }
         } else if (currentPrompt?.kind === 'yn') {
           sendToRelay({ type: 'reject' });
         } else {
