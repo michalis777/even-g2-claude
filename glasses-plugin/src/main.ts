@@ -194,7 +194,9 @@ function stripAnsi(str: string): string {
 
 // Word-wrap a single logical line to `width` characters. Breaks on the last
 // space at or before `width`; if no space fits (single long token), falls back
-// to a hard mid-word break so no character is ever lost.
+// to a hard mid-word break so no character is ever lost. Used only for
+// choice-mode option text — scroll mode relies on tmux's own wrapping at
+// -x LINE_CHAR_LIMIT, so one tmux row = one display row.
 function wrapLine(line: string, width: number): string[] {
   if (line.length <= width) return [line];
   const out: string[] = [];
@@ -209,25 +211,12 @@ function wrapLine(line: string, width: number): string[] {
   return out;
 }
 
-// Flatten `allLines` into the display-line buffer we actually scroll over.
-// Each raw tmux line is stripped of ANSI codes and word-wrapped to
-// LINE_CHAR_LIMIT, so one long terminal line may emit several display lines.
-// This is recomputed per render — allLines is bounded by the relay's
-// maxLines, so the cost is negligible.
-function computeDisplayLines(): string[] {
-  const out: string[] = [];
-  for (const line of allLines) {
-    out.push(...wrapLine(stripAnsi(line), LINE_CHAR_LIMIT));
-  }
-  return out;
-}
-
 function maxOffset(): number {
-  return Math.max(0, computeDisplayLines().length - VISIBLE_LINES);
+  return Math.max(0, allLines.length - VISIBLE_LINES);
 }
 
 function visibleLines(offset: number): string[] {
-  return computeDisplayLines().slice(offset, offset + VISIBLE_LINES);
+  return allLines.slice(offset, offset + VISIBLE_LINES);
 }
 
 function clampOffset(o: number): number {
@@ -292,7 +281,7 @@ async function renderDisplay() {
     });
     bodyText = out.join('\n');
   } else {
-    bodyText = lines.join('\n') || '(no output)';
+    bodyText = lines.map(stripAnsi).join('\n') || '(no output)';
   }
 
   // ── Compose single-container text: status + body + optional hints ───────
