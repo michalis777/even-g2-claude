@@ -16,12 +16,13 @@ Bootstrap the full Even G2 Claude dev environment so the user can interact with 
 
 ## Steps
 
-1. **Clean slate.** Kill any stale processes from previous sessions in a single Bash call. Leave Vite alone — restarting it is slow and HMR survives across sessions, so only start it fresh in step 5 if nothing is listening on port 5173.
+1. **Clean slate.** Kill any stale processes from previous sessions in a single Bash call. Also truncate `/tmp/jarvis-debug.log` (the unified log file read by `/jarvis-debug`) so the new session starts from zero. Leave Vite alone — restarting it is slow and HMR survives across sessions, so only start it fresh in step 5 if nothing is listening on port 5173.
 
    ```bash
    tmux kill-session -t claudecode 2>/dev/null
    pkill -f "node server.js" 2>/dev/null
    pkill -f "evenhub-simulator" 2>/dev/null
+   : > /tmp/jarvis-debug.log
    ```
 
 2. **Relay token.** Ensure `/tmp/relay-token` exists with ≥32 characters. Generate one only if missing or too short — don't rotate on every invocation because the simulator caches it in its URL hash.
@@ -48,18 +49,18 @@ Bootstrap the full Even G2 Claude dev environment so the user can interact with 
 
    After launching, read the task's output once to confirm the `Claude Code Glasses Relay — v2` banner printed and there's no `EADDRINUSE` error. If port 3000 is still occupied, something in step 1 failed — surface it in the report.
 
-5. **Vite dev server.** First check if vite is already running (`lsof -nP -iTCP:5173 -sTCP:LISTEN`). If yes, skip. If no, start it as a background task:
+5. **Vite dev server.** First check if vite is already running (`lsof -nP -iTCP:5173 -sTCP:LISTEN`). If yes, skip. If no, start it as a background task. Stdout+stderr is piped through an awk tagger so every line lands in `/tmp/jarvis-debug.log` prefixed `[vite]` with an ISO timestamp:
 
    ```bash
-   cd /Users/Mike.Kantartjis/Documents/dikaMou/even-g2-claude/glasses-plugin && npm run dev
+   cd /Users/Mike.Kantartjis/Documents/dikaMou/even-g2-claude/glasses-plugin && npm run dev 2>&1 | awk '{ cmd="date -u +%Y-%m-%dT%H:%M:%SZ"; cmd | getline ts; close(cmd); print ts, "[vite] LOG", $0; fflush() }' | tee -a /tmp/jarvis-debug.log
    ```
 
    Tail the task output once and confirm you see `VITE ... ready in`.
 
-6. **Even Hub simulator.** Start as a background task, passing the token and relay URL as URL hash params so the plugin gets configured on load:
+6. **Even Hub simulator.** Start as a background task, passing the token and relay URL as URL hash params so the plugin gets configured on load. Same awk tagger, this time tagged `[sim]`:
 
    ```bash
-   TOKEN=$(cat /tmp/relay-token); npx -y @evenrealities/evenhub-simulator "http://localhost:5173/#token=$TOKEN&url=ws://localhost:3000"
+   TOKEN=$(cat /tmp/relay-token); npx -y @evenrealities/evenhub-simulator "http://localhost:5173/#token=$TOKEN&url=ws://localhost:3000" 2>&1 | awk '{ cmd="date -u +%Y-%m-%dT%H:%M:%SZ"; cmd | getline ts; close(cmd); print ts, "[sim] LOG", $0; fflush() }' | tee -a /tmp/jarvis-debug.log
    ```
 
 7. **Verify.** In one Bash call, confirm the full state:
@@ -93,6 +94,8 @@ Post a single status block like this. Keep it short:
 Ready. Type new requests in the new Terminal window.
 Watch output + resolve prompts on the glasses simulator.
 (Detach the Terminal with Ctrl-b d — the relay polls tmux independently.)
+
+Unified logs: /tmp/jarvis-debug.log  (inspect via /jarvis-debug)
 ```
 
 Mark any failed component with ❌ and put the error underneath, indented. Do not offer to fix — leave that to the user's next message.

@@ -27,6 +27,40 @@ const { WebSocketServer } = require('ws');
 const { execSync }        = require('child_process');
 const readline            = require('readline');
 const crypto              = require('crypto');
+const fs                  = require('fs');
+
+// ── Unified debug log ────────────────────────────────────────────────────────
+// Append-only sink shared with the glasses-plugin (via ws 'log' messages) and
+// the jarvis-init skill (which tees vite/sim stdout here). Inspect via the
+// jarvis-debug skill instead of opening the simulator's DevTools.
+const DEBUG_LOG_PATH = '/tmp/jarvis-debug.log';
+
+function appendDebugLog(source, level, message) {
+  try {
+    const iso = new Date().toISOString();
+    const lvl = String(level || 'log').toUpperCase();
+    const line = `${iso} [${source}] ${lvl} ${message}\n`;
+    fs.appendFileSync(DEBUG_LOG_PATH, line);
+  } catch {
+    // Swallow — debug logging must never break the relay.
+  }
+}
+
+// Wrap console.* once so every existing relay log line mirrors to the file
+// tagged [relay]. Original stdout behaviour is preserved for the tmux pane.
+(function wrapConsole() {
+  const origLog   = console.log.bind(console);
+  const origWarn  = console.warn.bind(console);
+  const origError = console.error.bind(console);
+  const fmt = (args) => args.map(a => {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error)    return a.stack || a.message;
+    try { return JSON.stringify(a); } catch { return String(a); }
+  }).join(' ');
+  console.log   = (...a) => { origLog(...a);   appendDebugLog('relay', 'log',   fmt(a)); };
+  console.warn  = (...a) => { origWarn(...a);  appendDebugLog('relay', 'warn',  fmt(a)); };
+  console.error = (...a) => { origError(...a); appendDebugLog('relay', 'error', fmt(a)); };
+})();
 
 // ── Token enforcement ─────────────────────────────────────────────────────────
 const RELAY_TOKEN = process.env.RELAY_TOKEN;
@@ -389,6 +423,23 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
+
+    // ── Plugin debug logs (allowed pre-auth so we can debug auth failures) ──
+    // Rate-limited per client to ~50 msg/sec; excess silently dropped.
+    if (msg.type === 'log') {
+      const now = Date.now();
+      if (!ws._logWindowStart || now - ws._logWindowStart > 1000) {
+        ws._logWindowStart = now;
+        ws._logCount = 0;
+      }
+      if (ws._logCount++ < 50) {
+        const level = ['log', 'warn', 'error'].includes(msg.level) ? msg.level : 'log';
+        let text = typeof msg.message === 'string' ? msg.message : '';
+        if (text.length > 2048) text = text.slice(0, 2048) + '…';
+        if (text) appendDebugLog('plugin', level, text);
+      }
+      return;
+    }
 
     // ── Not yet authenticated ────────────────────────────────────────────────
     if (!ws.authenticated) {

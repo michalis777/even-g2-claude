@@ -87,6 +87,66 @@ let pageCreated                   = false;
 type Bridge = Awaited<ReturnType<typeof waitForEvenAppBridge>>;
 let bridge: Bridge;
 
+// ── Debug log forwarding ──────────────────────────────────────────────────────
+// Wraps console.log/warn/error so every log is *also* forwarded to the relay
+// as a {type:'log'} message. The relay appends them to /tmp/jarvis-debug.log,
+// which is inspected via the jarvis-debug skill — no DevTools required.
+//
+// Buffered pre-WS-open so startup logs aren't lost. Flushed in ws.onopen
+// BEFORE auth, since the relay accepts 'log' pre-auth (so we can debug auth
+// failures themselves). Invariant: do NOT call console.log from hot paths
+// (per-poll broadcasts) or this will flood the disk.
+type LogLevel = 'log' | 'warn' | 'error';
+interface BufferedLog { level: LogLevel; message: string; }
+const LOG_BUFFER_CAP = 200;
+const logBuffer: BufferedLog[] = [];
+let inLogShim = false;
+
+function formatLogArgs(args: unknown[]): string {
+  return args.map(a => {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error)    return a.stack || a.message;
+    try { return JSON.stringify(a); } catch { return String(a); }
+  }).join(' ');
+}
+
+function forwardLog(level: LogLevel, message: string) {
+  if (inLogShim) return;
+  inLogShim = true;
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'log', level, message }));
+    } else {
+      if (logBuffer.length >= LOG_BUFFER_CAP) logBuffer.shift();
+      logBuffer.push({ level, message });
+    }
+  } catch {
+    // Never let logging errors propagate.
+  } finally {
+    inLogShim = false;
+  }
+}
+
+function installConsoleShim() {
+  const orig = {
+    log:   console.log.bind(console),
+    warn:  console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+  console.log   = (...a: unknown[]) => { orig.log(...a);   forwardLog('log',   formatLogArgs(a)); };
+  console.warn  = (...a: unknown[]) => { orig.warn(...a);  forwardLog('warn',  formatLogArgs(a)); };
+  console.error = (...a: unknown[]) => { orig.error(...a); forwardLog('error', formatLogArgs(a)); };
+}
+
+function flushLogBuffer() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  while (logBuffer.length > 0) {
+    const entry = logBuffer.shift()!;
+    try { ws.send(JSON.stringify({ type: 'log', level: entry.level, message: entry.message })); }
+    catch { break; }
+  }
+}
+
 // ── Session storage helpers ───────────────────────────────────────────────────
 async function saveSession(sessionToken: string, expiresAt: number) {
   try {
@@ -121,25 +181,51 @@ async function clearSession() {
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
+function stripAnsi(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/\x1B\[[0-9;]*[mGKHF]/g, '');
+}
+
+// Word-wrap a single logical line to `width` characters. Breaks on the last
+// space at or before `width`; if no space fits (single long token), falls back
+// to a hard mid-word break so no character is ever lost.
+function wrapLine(line: string, width: number): string[] {
+  if (line.length <= width) return [line];
+  const out: string[] = [];
+  let rest = line;
+  while (rest.length > width) {
+    let breakAt = rest.lastIndexOf(' ', width);
+    if (breakAt <= 0) breakAt = width; // no space → hard wrap
+    out.push(rest.slice(0, breakAt).trimEnd());
+    rest = rest.slice(breakAt).trimStart();
+  }
+  if (rest.length > 0) out.push(rest);
+  return out;
+}
+
+// Flatten `allLines` into the display-line buffer we actually scroll over.
+// Each raw tmux line is stripped of ANSI codes and word-wrapped to
+// LINE_CHAR_LIMIT, so one long terminal line may emit several display lines.
+// This is recomputed per render — allLines is bounded by the relay's
+// maxLines, so the cost is negligible.
+function computeDisplayLines(): string[] {
+  const out: string[] = [];
+  for (const line of allLines) {
+    out.push(...wrapLine(stripAnsi(line), LINE_CHAR_LIMIT));
+  }
+  return out;
+}
+
 function maxOffset(): number {
-  return Math.max(0, allLines.length - VISIBLE_LINES);
+  return Math.max(0, computeDisplayLines().length - VISIBLE_LINES);
 }
 
 function visibleLines(offset: number): string[] {
-  return allLines.slice(offset, offset + VISIBLE_LINES);
+  return computeDisplayLines().slice(offset, offset + VISIBLE_LINES);
 }
 
 function clampOffset(o: number): number {
   return Math.max(0, Math.min(o, maxOffset()));
-}
-
-function truncate(line: string, maxChars = LINE_CHAR_LIMIT): string {
-  return line.length <= maxChars ? line : line.slice(0, maxChars - 1) + '…';
-}
-
-function stripAnsi(str: string): string {
-  // eslint-disable-next-line no-control-regex
-  return str.replace(/\x1B\[[0-9;]*[mGKHF]/g, '');
 }
 
 // Identity key for a Prompt, used to detect "same prompt" across polls so we
@@ -184,18 +270,41 @@ async function renderDisplay() {
     bodyText = 'Auth failed.\n\nCheck RELAY_TOKEN matches\nthe server.';
   } else if (inChoice) {
     const p = currentPrompt as Extract<Prompt, { kind: 'choice' }>;
-    const header = p.question ? truncate(p.question) + '\n' : '';
-    const optionLines = p.options.map((opt, i) => {
+    const out: string[] = [];
+    if (p.question) out.push(...wrapLine(p.question, LINE_CHAR_LIMIT));
+    p.options.forEach((opt, i) => {
       const marker = i === selectedChoiceIndex ? '▶' : ' ';
-      return truncate(`${marker} ${i + 1}. ${opt}`);
+      const prefix = `${marker} ${i + 1}. `;
+      const wrapped = wrapLine(opt, LINE_CHAR_LIMIT - prefix.length);
+      out.push(prefix + wrapped[0]);
+      for (let j = 1; j < wrapped.length; j++) {
+        out.push(' '.repeat(prefix.length) + wrapped[j]);
+      }
     });
-    bodyText = header + optionLines.join('\n');
+    bodyText = out.join('\n');
   } else {
-    bodyText = lines.map(l => truncate(stripAnsi(l))).join('\n') || '(no output)';
+    bodyText = lines.join('\n') || '(no output)';
   }
 
   // ── Compose single-container text: status + body + optional hints ───────
-  const outputText = [statusText, bodyText, hintsText].filter(s => s.length > 0).join('\n');
+  // The simulator (and real firmware) caps TextContainerUpgrade content at
+  // 999 BYTES, not chars. `VISIBLE_LINES × LINE_CHAR_LIMIT` is a char budget,
+  // and Unicode in Claude's output (box-drawing ╌, bullets ⏺, markers ❯) is
+  // 3 bytes each — so a full 13-line buffer routinely composes to 1100-1400
+  // bytes and the upgrade gets rejected, freezing the display on the last
+  // successful render. Trim from the top of the body (oldest visible line)
+  // until the whole composed text fits, leaving ~50 bytes of headroom.
+  const BYTE_BUDGET = 950;
+  const byteLen = (s: string) => new TextEncoder().encode(s).length;
+  const compose = (body: string) =>
+    [statusText, body, hintsText].filter(s => s.length > 0).join('\n');
+
+  let bodyLines = bodyText.split('\n');
+  let outputText = compose(bodyLines.join('\n'));
+  while (byteLen(outputText) > BYTE_BUDGET && bodyLines.length > 1) {
+    bodyLines.shift();
+    outputText = compose(bodyLines.join('\n'));
+  }
 
   const outputContainer = new TextContainerProperty({
     xPosition: 0, yPosition: 0,
@@ -240,6 +349,10 @@ async function connectRelay(url: string) {
   ws.onopen = async () => {
     connected = true;
     authenticated = false;
+
+    // Flush any logs buffered before the socket opened. Relay accepts 'log'
+    // pre-auth, so this runs before the auth/resume handshake below.
+    flushLogBuffer();
 
     // Try to resume with saved session first
     const savedToken = await loadSession();
@@ -424,6 +537,7 @@ function setupInput() {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function main() {
+  installConsoleShim();
   console.log('[plugin] Waiting for Even App Bridge...');
   bridge = await waitForEvenAppBridge();
   console.log('[plugin] Bridge ready');
