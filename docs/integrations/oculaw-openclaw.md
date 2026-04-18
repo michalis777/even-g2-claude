@@ -39,6 +39,10 @@ The downstream weakness is the design's sharpest edge: the glasses path depends 
 
 ## Recommended deployment pattern
 
+> Current active plan: **2019 Intel MBP trial**. Full phase-by-phase deployment steps, Mosyle MDM risk assessment, connector rollout order, and OcuClaw handoff steps are in [`mbp-trial-plan.md`](./mbp-trial-plan.md). The summary below documents the principles; the plan is the executable.
+
+
+
 Matches this repo's existing Tailscale + session-token pattern (`README.md` → Security Model):
 
 1. **Small VPS** — 2 vCPU / 4 GB RAM / 20 GB disk is a safe starting point for a single user with memory enabled. Documented minimums were not found in OpenClaw's public docs; scale up if you enable local embeddings. Hetzner/Fly/DO all work.

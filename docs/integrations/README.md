@@ -6,7 +6,8 @@ Major-docs folder tracking the integration surface we want around Even G2 + Clau
 
 | Doc | Scope |
 |---|---|
-| [`oculaw-openclaw.md`](./oculaw-openclaw.md) | Architecture, deployment, and threat model for running an OpenClaw brain that OcuClaw-on-G2 talks to. |
+| [`mbp-trial-plan.md`](./mbp-trial-plan.md) | **Start here.** Concrete deployment plan for the 2019 Intel MBP trial: phases, Mosyle risk assessment, connector rollout order, and the OcuClaw handoff once the glasses arrive. |
+| [`oculaw-openclaw.md`](./oculaw-openclaw.md) | Architecture, auth planes, threat model, and CVE posture for the OcuClaw + OpenClaw system. Reference doc for the MBP plan. |
 | [`mcp-targets.md`](./mcp-targets.md) | Per-integration MCP-vs-API matrix for the six initial targets (Google Calendar, iCalendar, Gmail, GHE, Neon, Vercel). |
 
 ## Current wishlist
