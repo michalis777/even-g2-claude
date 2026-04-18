@@ -11,39 +11,88 @@ Deployment plan for running OpenClaw on the existing 2019 Intel MBP (32 GB RAM, 
 
 ---
 
+## 0. Mosyle profile audit — what we know about this host
+
+Based on `sudo profiles show -all` run 2026-04-18 (32 profiles, org `Digital Artefacts LLC`). This is the binding constraint set for everything below.
+
+### Nothing blocks the core plan
+
+| Concern | Profile | Status |
+|---|---|---|
+| URL / content filter | none | ✅ Outbound to `api.anthropic.com`, `generativelanguage.googleapis.com`, `mcp.neon.tech`, `mcp.vercel.com`, `api.github.com` is free |
+| VPN enforcement | none | ✅ Tailscale can run |
+| DNS override | none | ✅ |
+| Kernel / system extensions | #7, #25, #31 | ✅ Tailscale uses Network Extension, not kext — should pass |
+| Application firewall | #26 (enforced ON) + #32 (logging ON) | ✅ Already where we want it — **skip Phase 3's firewall steps** |
+
+### Three hard constraints that reshape the plan
+
+1. **Mosyle has Full Disk Access via TCC** (profiles #10, #14, #15, #22, #30 — `com.apple.TCC.configuration-profile-policy`). The Mosyle agent can read every file on disk, including `~/.openclaw/workspace` (memory DB), `~/.openclaw/openclaw.json` (secrets), and anything else we store. **This is the single biggest risk** — it makes the memory DB effectively visible to the employer.
+2. **Two corporate CA roots trusted system-wide** (profiles #16 `da-root.pem`, #19 `DA Root CA`). Alone not interception; on the `dart_secure` corp wifi, enables it. Do all OAuth flows off-corp-wifi.
+3. **FileVault recovery key escrowed to Mosyle** (#8 payload[4]). FileVault protects from a stolen laptop, not from the employer.
+
+### Two things to test before committing to Phase 2
+
+- **LaunchAgent install** — profile #11 `com.apple.servicemanagement` controls background services. `openclaw onboard --install-daemon` creates a LaunchAgent; might silently fail. Install a dummy plist first to verify.
+- **Tailscale system extension approval** — profile #31. The approval UI may require admin confirmation that could be blocked.
+
+---
+
 ## 1. Plan
 
 ### Phase 0 — Pre-flight (half day)
 
-Verify the machine can actually run this before touching any config.
+Three explicit gates. If any fail, stop and re-plan before proceeding.
+
+**Gate A — Tailscale system extension installs and connects**
 
 ```bash
-# Check admin rights
-id              # should show staff + admin groups
-sudo -v         # should succeed without error
-
-# Check OS version (Sequoia = 15.x is fine; anything below 13 is a problem)
-sw_vers
-
-# Check Tailscale — most likely blocked by MDM firewall or restricted installs
-# Try installing first before committing to any further phases
 brew install --cask tailscale
+open -a Tailscale
+# A system extension approval dialog should appear. If it does NOT appear
+# and Tailscale fails to start, Mosyle profile #31 is blocking — stop here.
 tailscale up
-
-# Check Node version
-node --version  # need 22+; install via nvm if missing
-nvm install 22 && nvm use 22
-
-# Check if LaunchAgents are writable (needed for OpenClaw daemon auto-start)
-ls -la ~/Library/LaunchAgents
-
-# Check pfctl / firewall state
-sudo pfctl -s info
+tailscale status   # should show tailnet IP 100.x.y.z
+tailscale ping <your-phone>
 ```
 
-If `tailscale up` is blocked by Mosyle network policy, stop — the whole secure-tunnel model depends on Tailscale. See Risk 1 in the risk section below.
+**Gate B — LaunchAgent install works (dummy test)**
 
-If `sudo` requires a company-issued MDM approval prompt, note it but proceed — you'll still have full admin rights once approved.
+Before trusting `openclaw onboard --install-daemon`, verify that Mosyle's background-service-management profile (#11) doesn't silently block user LaunchAgents:
+
+```bash
+# Create a trivial test LaunchAgent
+cat > ~/Library/LaunchAgents/com.test.hello.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.test.hello</string>
+  <key>ProgramArguments</key><array><string>/bin/echo</string><string>hello</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+EOF
+launchctl load ~/Library/LaunchAgents/com.test.hello.plist
+launchctl list | grep com.test.hello   # must return a line
+launchctl unload ~/Library/LaunchAgents/com.test.hello.plist
+rm ~/Library/LaunchAgents/com.test.hello.plist
+```
+
+If `launchctl list` returns nothing, OpenClaw's auto-start daemon won't install either — fall back to running `openclaw gateway` manually in a `tmux` or `screen` session (acceptable, just less convenient).
+
+**Gate C — Rest of the environment checks**
+
+```bash
+id                                       # confirm admin group
+sudo -v                                  # confirm sudo works (MDM prompt OK)
+sw_vers                                  # macOS 13+ required; Sequoia 15 is fine
+node --version                           # need 22+; use nvm if not
+curl -s https://api.anthropic.com/v1/messages -o /dev/null -w "%{http_code}\n"
+                                         # expect 401 (unauthed but reachable), not 0 or network error
+curl -s https://generativelanguage.googleapis.com -o /dev/null -w "%{http_code}\n"
+                                         # expect 200/404, not 0
+```
+
+If any of A/B/C fails, document what happened and escalate before doing anything irreversible.
 
 ---
 
@@ -138,24 +187,45 @@ chmod 700 ~/.openclaw/
 
 ### Phase 3 — Harden the surface (half day)
 
-The `openclaw/openclaw-ansible` playbook targets Linux (UFW + Docker). For macOS, apply the equivalent manually:
+Mosyle already enforces the macOS Application Firewall (profile #26) with logging (#32), so we skip the firewall-on steps. The real hardening here is **defending against Mosyle's own read access** to the memory DB and secrets.
 
-**macOS Application Firewall:**
+**Memory DB encryption at rest (critical — mitigates Mosyle TCC Full Disk Access):**
+
+Mosyle's TCC profile grants the Mosyle agent Full Disk Access. Anything in plaintext under `~/.openclaw/` is readable by them. The mitigation is to store the memory DB on an **encrypted sparseimage** whose passphrase lives only in your personal password manager:
+
 ```bash
-# Enable firewall (may already be on via Mosyle)
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on
-# Block all incoming except explicitly allowed apps
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setblockall on
-# Allow Tailscale and OpenClaw gateway explicitly
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /Applications/Tailscale.app/Contents/MacOS/Tailscale
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(which node)
+# Create a 10 GB encrypted sparseimage, passphrase from personal 1Password/Bitwarden
+hdiutil create -size 10g -type SPARSE -fs APFS -encryption AES-256 \
+  -volname openclaw-workspace ~/openclaw-workspace.sparseimage
+
+# Mount it (prompts for passphrase)
+hdiutil attach ~/openclaw-workspace.sparseimage
+# -> mounts at /Volumes/openclaw-workspace
+
+# Point OpenClaw at the mounted volume
+# Edit ~/.openclaw/openclaw.json:
+#   "memory": { "workspacePath": "/Volumes/openclaw-workspace" }
+
+# Unmount when not in use (e.g., overnight)
+hdiutil detach /Volumes/openclaw-workspace
 ```
 
-**Other hardening:**
-- Disable Screen Sharing and Remote Login if not needed (`System Settings → General → Sharing`)
-- Run `sudo log stream --predicate 'process == "openclaw"'` for a few minutes to verify no unexpected outbound hosts
-- Subscribe to OpenClaw GitHub security advisories: `github.com/openclaw/openclaw → Watch → Custom → Security alerts`
-- Set a weekly calendar reminder to run `npm update -g openclaw` and verify version is patched
+Mosyle will see the `.sparseimage` file but cannot decrypt it without your passphrase. The memory DB is readable only when mounted, which is only when OpenClaw is running. Trade-off: you either auto-mount on login (reduces protection — passphrase must live in Keychain, which Mosyle can potentially access) or mount manually each morning.
+
+**Secrets handling:**
+- Store all provider API keys via `security add-generic-password ... -s <name>` — Keychain is not airtight against Mosyle but is still better than plaintext config.
+- Never put the raw API keys into `~/.openclaw/openclaw.json`. Reference them via environment variables injected from Keychain at daemon-start time.
+- The OpenClaw device token at `stateDir/ocuclaw-device-token.json` — keep this *inside* the encrypted sparseimage too if the plugin allows configurable `stateDir`.
+
+**OAuth discipline (mitigates corporate CA interception risk):**
+- Perform all OAuth flows (Gmail, Google Calendar, GHE, Vercel, Neon) over cellular tether or home wifi, **never** the `dart_secure` corporate network. The DA-root CA is trusted system-wide and *can* be used for TLS interception on corp wifi.
+- Once tokens are issued, their refresh flow uses cert-pinned endpoints in most SDKs — but the initial issuance is the window of exposure.
+
+**Other:**
+- Disable Screen Sharing and Remote Login (`System Settings → General → Sharing`) if not required for other work.
+- Subscribe to OpenClaw GitHub security advisories: `github.com/openclaw/openclaw → Watch → Custom → Security alerts`.
+- Weekly calendar reminder: `npm update -g openclaw` and verify version is ≥ latest security patch.
+- `sudo log stream --predicate 'process == "openclaw"'` for a few minutes after first run to verify outbound hosts match expectations.
 
 ---
 
@@ -221,61 +291,100 @@ Track:
 
 ## 2. Risk Assessment
 
-### R1 — Mosyle blocks Tailscale (HIGH, mitigations exist)
+Re-graded after the `sudo profiles show -all` audit (2026-04-18).
 
-Mosyle can enforce network filtering that intercepts or blocks VPN/tunnel traffic. Tailscale uses UDP port 41641 + DERP relay (TCP 443 fallback).
+### R1 — Employer read access to OpenClaw memory via TCC Full Disk Access (HIGH)
 
-| Sub-risk | Likelihood | Mitigation |
-|---|---|---|
-| Tailscale UDP blocked | Medium | Tailscale auto-falls back to DERP over TCP 443; test before committing |
-| Mosyle network filter logs Tailscale hostnames | Medium | Your tailnet traffic is encrypted end-to-end; Mosyle sees the connection, not the content |
-| MDM policy explicitly forbids VPN client installs | Low | You said no one monitors — but check `sudo profiles show -all` for relevant payloads |
+Mosyle TCC configuration profiles (#10, #14, #15, #22, #30) pre-grant the Mosyle agent Full Disk Access. It can read anything at rest, including `~/.openclaw/workspace` (memory DB), `~/.openclaw/openclaw.json` (if it held plaintext keys), cached OAuth tokens, and shell history.
 
-**Pre-flight test:** run `tailscale ping <your-phone>` from the MBP before starting Phase 1. If it works, proceed. If not, everything breaks and you need a different host.
+**Exposure:** every personal email subject, every calendar event, every Neon query result that flows into OpenClaw's long-term memory is readable by the employer without notice.
 
-### R2 — MDM remote wipe on offboarding (HIGH, recoverable with prep)
+**Mitigations (partial, not airtight):**
+- Memory DB on encrypted sparseimage with passphrase outside Keychain (Phase 3).
+- Scope integrations to work-adjacent only — **no Gmail, no personal iCalendar** on this machine. Calendar and GHE through work accounts are already in-scope for the employer anyway.
+- Treat the MBP trial as a **proof of concept for workflow**, not a production brain. Personal data migration to real personal hardware (Mac Mini, home server, personal VPS) is the fix, not a config change here.
 
-If you leave the role or the company reclaims the device, Mosyle wipe destroys everything: OpenClaw memory DB, config, installed tools, credentials.
+### R2 — Employer TLS interception via installed CA roots (MEDIUM)
 
-**Mitigation:** from day one, daily encrypted backup of `~/.openclaw/workspace` (the SQLite memory store) to a personal location:
+Profiles #16 (`da-root.pem`) and #19 (`DA Root CA`) install Digital Artefacts CAs as trusted system-wide. On the `dart_secure` corporate wifi (profile #16 also configures this SSID), TLS interception is technically possible — the CA lets the corp proxy impersonate any hostname without browser warnings.
+
+**Exposure:** browser-based OAuth flows on corp wifi can be MITM'd, leaking refresh tokens for Gmail, GHE, Calendar, Vercel, Neon.
+
+**Mitigation:** all OAuth flows over **cellular tether or home wifi**, never on `dart_secure`. Most Claude Code / MCP SDK traffic uses cert-pinning, but browser OAuth does not. After initial token issuance, normal API traffic is low-risk.
+
+### R3 — MDM remote wipe on offboarding (HIGH, recoverable with prep)
+
+If you leave the role or the device is reclaimed, Mosyle wipes everything — including the encrypted sparseimage file. FileVault recovery key is escrowed to Mosyle (#8 payload[4]), so "I'll resurrect the disk offline" isn't an option either.
+
+**Mitigation:** from day one, nightly encrypted backup of the sparseimage to personal cloud storage:
 
 ```bash
-# Add to crontab — backs up every night at 2am
-0 2 * * * tar czf - ~/.openclaw/workspace | openssl enc -aes-256-cbc -pbkdf2 -pass env:BACKUP_PASS | rclone rcat personal-s3:openclaw-backups/workspace-$(date +%Y%m%d).tar.gz.enc
+# Add to user crontab — nightly at 2am, only if OpenClaw is mounted
+0 2 * * * /usr/local/bin/openclaw-backup.sh
 ```
 
-Store the `BACKUP_PASS` in your **personal** password manager, not macOS Keychain (Keychain is wiped with the device).
+`openclaw-backup.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
+SRC=~/openclaw-workspace.sparseimage
+if [ ! -f "$SRC" ]; then exit 0; fi
+STAMP=$(date +%Y%m%d)
+# Sparseimage is already encrypted; we still add a second passphrase for cloud at rest
+rclone copy "$SRC" personal-b2:openclaw-backups/ --transfers 1 --checksum
+echo "$(date -u) — backed up" >> ~/.openclaw/backup.log
+```
 
-### R3 — Corporate acceptable-use policy (MEDIUM, legal/political)
+Keep the sparseimage passphrase and rclone config in your **personal** 1Password / Bitwarden, never in macOS Keychain (Keychain wipes with the device).
 
-Running personal workloads on work hardware is in a gray zone at most companies. If Mosyle telemetry reports app inventory to IT, OpenClaw will show up.
+### R4 — Acceptable-use policy (MEDIUM, legal/political)
 
-**Exposure:** OpenClaw's memory will contain personal data (Gmail content, calendar events, Neon rows). That data technically lives on company hardware.
+Running personal workloads on work hardware is in a gray zone. Mosyle telemetry (profile #12 `Mosyle Diagnostic Report`, profile #29 `Mosyle Push`) reports back to IT. OpenClaw will show up in app inventory as a Node global install.
 
-**Mitigation:** Keep Gmail disabled until you've moved this to personal hardware. Calendar and GHE are lower risk (work-adjacent anyway). This risk is the primary reason to treat the MBP as a **temporary** trial, not a permanent home.
+**Mitigation:** this is why R1's scoping matters — if the only things OpenClaw sees are work-adjacent (GHE, Vercel, Neon dev branches), the acceptable-use posture is comparable to running Claude Code itself (which you already do on this machine). Keep it in that shape until a move to personal hardware.
 
-### R4 — Forced OS updates / reboots (MEDIUM, operational)
+### R5 — Forced OS updates / reboots (MEDIUM, operational)
 
-Mosyle can push required updates and enforce reboots. A reboot mid-Claude Code session would kill the Enderfga wrapper and any in-progress agent work.
+Mosyle Software Update profile (#24) controls update cadence; forced reboots will kill in-progress Claude Code sessions.
 
 **Mitigation:**
-- Set `openclaw gateway` LaunchAgent to restart on exit (`KeepAlive: true` in the plist)
-- Claude Code sessions are stateless per-invocation; partial work is lost but safe (no data corruption)
-- Check Mosyle's update enforcement window — if it's business-hours-only, schedule long Claude Code sessions for evenings
+- `KeepAlive: true` on the OpenClaw LaunchAgent so the gateway auto-restarts.
+- Claude Code sessions are stateless per-invocation; a mid-run reboot loses in-progress agent work but cannot corrupt the memory DB (SQLite WAL is crash-safe).
+- Check the enforcement window in the Mosyle portal; schedule long sessions outside it.
 
-### R5 — SSD wear (LOW, long-term)
+### R6 — Tailscale blocked (MEDIUM, but looks unlikely given audit)
 
-Continuous OpenClaw daemon + SQLite writes on a 2019 MBP SSD. The 2019 Intel MBPs also had well-documented GPU (Radeon 5500M/5600M) and logic board failures at elevated temperatures.
+No VPN-blocking, content-filter, or network-extension-denial profile was found. Tailscale **should** install and connect. Still possible Mosyle pushes a new profile later.
 
-**Mitigation:** keep the MBP in a well-ventilated spot, fan side unobstructed. Check `sudo smartctl -a /dev/disk0` monthly. If SMART shows reallocated sectors, back up and plan the migration immediately.
+**Mitigation:** Phase 0 Gate A tests this. If it ever stops working, you need a different host — do not try to work around Mosyle policy on work hardware.
 
-### R6 — macOS end-of-life (LOW, future)
+### R7 — SSD / hardware wear (LOW, long-term)
 
-Sequoia (15) is likely the last macOS for the 2019 Intel MBP. Apple security patches for it will end in approximately 2027. If you're still running this in 2027+, move it.
+Continuous writes on a 2019 MBP SSD. The 2019 Intel MBPs also had well-documented GPU (Radeon 5500M/5600M) and logic-board failures under heat.
 
-### R7 — OpenClaw CVEs (MEDIUM, ongoing)
+**Mitigation:** well-ventilated spot, fan-side unobstructed, monthly `sudo smartctl -a /dev/disk0`. If SMART reports reallocated sectors, migrate immediately.
 
-See `oculaw-openclaw.md` for full CVE history. Short version: pin to ≥ 2026.2.25, subscribe to advisories, patch weekly. The MBP trial has no upstream buffer — you're the ops team.
+### R8 — macOS end-of-life (LOW, future)
+
+Sequoia (15) is likely the last macOS for a 2019 Intel MBP. Apple security patches end around 2027.
+
+### R9 — OpenClaw CVEs (MEDIUM, ongoing)
+
+See `oculaw-openclaw.md` for full CVE history. Pin ≥ 2026.2.25, subscribe to advisories, patch weekly. MBP trial has no upstream buffer — you are the ops team.
+
+### Risk summary
+
+| # | Risk | Rating |
+|---|---|---|
+| R1 | Employer TCC Full Disk Access → memory DB readable | **HIGH** |
+| R3 | MDM remote wipe on offboarding | **HIGH** |
+| R2 | TLS interception via corp CA on dart_secure wifi | MEDIUM |
+| R4 | Acceptable-use policy exposure | MEDIUM |
+| R5 | Forced OS updates / reboots | MEDIUM |
+| R6 | Tailscale blocked (audit suggests no, still worth Gate A) | MEDIUM |
+| R9 | OpenClaw CVEs | MEDIUM |
+| R7 | Hardware wear | LOW |
+| R8 | macOS EOL | LOW |
 
 ---
 
@@ -283,29 +392,32 @@ See `oculaw-openclaw.md` for full CVE history. Short version: pin to ≥ 2026.2.
 
 Full per-integration details are in [`mcp-targets.md`](./mcp-targets.md). This section tracks what's enabled, what's staged, and what's deferred.
 
-### Active (roll out in Phase 5)
+Scoping rule for this machine (driven by R1 — employer TCC read access): **work-adjacent integrations only**. Personal Gmail and personal iCalendar are out until the stack moves to personal hardware.
+
+### Active on the MBP (roll out in Phase 5)
 
 | Connector | Mode | Scope | MCP Server |
 |---|---|---|---|
 | Vercel | Read | Deployments, build status, env var names (not values) | Official hosted: `https://mcp.vercel.com/` |
 | GHE | Read | PRs, issues, CI status, file contents | `github/github-mcp-server` local binary, `--read-only --toolsets repos,issues,pull_requests` |
 | Neon | Read | SELECT queries against named non-prod branches | `neondatabase/mcp-server-neon` hosted, dedicated read-only Postgres role |
-| Google Calendar | Read | Upcoming events, next 7 days | `taylorwilsdon/google_workspace_mcp`, `calendar.readonly` scope |
-| iCalendar | Read | Subscription feeds (Apple Calendar, etc.) | Custom OpenClaw skill — `ical.js` fetch+parse, 14-day window |
+| Google Calendar (work account only) | Read | Upcoming events, next 7 days | `taylorwilsdon/google_workspace_mcp`, `calendar.readonly` scope — only your work Google account, never personal |
 
-### Staged (add after 2-week burn-in)
+### Blocked on the MBP — move with the stack to personal hardware
 
-| Connector | Mode | Scope | Note |
-|---|---|---|---|
-| Gmail | Read | Metadata only (`gmail.metadata` scope — no body) | Highest blast-radius; add last, validate first |
+| Connector | Reason it's blocked here |
+|---|---|
+| Gmail (any account) | Memory would ingest sender/subject/body into TCC-readable store. Metadata scope mitigates body but not sender/subject — still too much personal signal on work hardware. |
+| Personal Google Calendar | Same as above for personal events. |
+| iCalendar subscription feeds | Typically personal (family, sports, hobbies) — same reasoning. |
 
-### Deferred (post-glasses / post-MBP)
+### Deferred (post-glasses or post-hardware-move)
 
 | Connector | Mode | Note |
 |---|---|---|
-| GHE write (create issue, post comment) | Write | Already in use-case wishlist; add write PAT scope separately from read PAT |
-| Slack | Read/write | Natural glasses use case but not scoped yet |
-| Calendar write | Write | Create events via voice — low priority, high risk of accidental events |
+| GHE write (create issue, post comment) | Write | Add write PAT scope separately from read; gate via approval prompt |
+| Slack | Read/write | Natural glasses use case, not scoped yet |
+| Calendar write | Write | High risk of accidental event creation via voice; not MBP-blocked, just not prioritized |
 
 ### Claude Code skill
 
