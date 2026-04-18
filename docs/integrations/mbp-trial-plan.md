@@ -126,62 +126,200 @@ fdesetup status
 
 ---
 
-### Phase 2 — OpenClaw install (1 day)
+### Phase 1.5 — Containment (1 day)
+
+**Why:** OpenClaw has a substantial CVE history (CVE-2026-25253 RCE, CVE-2026-32922 priv-esc, ~156 advisories tracked). A compromise of the daemon should not translate to a compromise of the machine — not your primary user's files, not Keychain, not LaunchAgents, not Claude Max credentials. Two layered defenses: a dedicated limited user, and Docker containerization via Colima.
+
+#### 1.5a — Dedicated macOS user `openclaw`
+
+Create a standard (non-admin) user. All OpenClaw operations run as this user.
 
 ```bash
-# Install OpenClaw globally — pin to a release >= 2026.2.25
-npm install -g openclaw@latest
-openclaw --version   # verify
-
-# Onboard — this creates ~/.openclaw/ and registers a LaunchAgent
-openclaw onboard --install-daemon
-
-# Verify the daemon is registered
-launchctl list | grep openclaw
+# As your primary admin user:
+sudo sysadminctl -addUser openclaw -fullName "OpenClaw Service" -password - -admin false
+# (prompted for password — store in personal password manager, not Keychain)
 ```
 
-Edit `~/.openclaw/openclaw.json` after onboarding. Key fields to set:
+Properties:
+- Separate home directory (`/Users/openclaw/`)
+- Separate Keychain from your primary user
+- No admin rights — cannot `sudo`, install global packages, or modify system files
+- No access to your primary user's files
+
+Switch to it via fast user switching (System Settings → Users & Groups → "Show fast user switching menu") or `su - openclaw`. Everything below runs as `openclaw`.
+
+#### 1.5b — Colima + Docker Compose
+
+Colima runs Docker on a lightweight Linux VM. On Intel Macs it uses QEMU or Hypervisor.framework — no kext, so Mosyle profiles #7 / #25 / #31 don't interfere.
+
+```bash
+# Install Homebrew formulae (one-time, any user with brew)
+brew install colima docker docker-compose
+
+# As the openclaw user, start the VM:
+colima start --cpu 4 --memory 8 --disk 30
+docker info                                # should succeed
+docker run --rm hello-world                # sanity check
+```
+
+Expect ~20-30% CPU overhead vs native on Intel. Acceptable for the OpenClaw daemon workload.
+
+#### 1.5c — Project layout
+
+```
+/Users/openclaw/
+├── openclaw-stack/
+│   ├── docker-compose.yml          # containment overrides (1.5d)
+│   ├── config/openclaw.json        # read-only mounted into container
+│   ├── secrets/                    # mode 0600, ignored by git
+│   └── enderfga/                   # host-side Claude Code sidecar (Phase 4)
+├── openclaw-workspace.sparseimage  # encrypted memory DB volume (Phase 3)
+└── .claude/                        # Claude Code auth for this user only
+```
+
+#### 1.5d — Hardened `docker-compose.yml`
+
+```yaml
+# /Users/openclaw/openclaw-stack/docker-compose.yml
+services:
+  openclaw:
+    image: openclaw/openclaw:<pinned-tag>     # ≥ 2026.2.25, pin by digest
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: false                          # daemon writes logs; constrain via tmpfs
+    tmpfs:
+      - /tmp:rw,size=200m,mode=1777
+      - /var/log:rw,size=50m
+    ports:
+      - "127.0.0.1:18789:18789"               # gateway — loopback only
+      - "127.0.0.1:9000:9000"                 # OcuClaw relay — loopback only (Phase 7)
+    volumes:
+      - /Volumes/openclaw-workspace:/workspace:rw     # encrypted memory DB (Phase 3)
+      - ./config/openclaw.json:/config/openclaw.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Enderfga sidecar on host
+    environment:
+      - CLAUDE_CODE_ENDPOINT=http://host.docker.internal:3001
+    secrets:
+      - gemini_api_key
+    mem_limit: 4g
+    cpus: "2.0"
+    restart: unless-stopped
+
+secrets:
+  gemini_api_key:
+    file: ./secrets/gemini_api_key.txt        # chmod 600
+```
+
+Why each line matters:
+- `cap_drop: [ALL]` — strips Linux capabilities; daemon needs none on a standard workload
+- `no-new-privileges:true` — child processes cannot escalate
+- `127.0.0.1` port binds — container is not directly reachable on the tailnet; a host forwarder handles that (1.5e)
+- File-based secrets via `docker secrets` — not visible in `docker inspect` or environment dumps
+- Volume scoped to the encrypted sparseimage — if the container is compromised, attacker can write garbage into the memory DB but cannot read host files
+- `mem_limit` / `cpus` — cap the blast radius of a runaway compromise
+
+#### 1.5e — Networking: host forwarder on tailnet IP
+
+Container ports bind loopback only; a small host-side forwarder (running as the `openclaw` user) binds to the Tailscale IP and proxies to loopback. Keeps the container off the tailnet directly.
+
+```bash
+brew install socat
+# Add a LaunchAgent: ~/Library/LaunchAgents/com.openclaw.forwarder.plist
+# that runs:
+socat TCP-LISTEN:18789,bind=100.x.y.z,fork,reuseaddr TCP:127.0.0.1:18789
+```
+
+Or adapt this repo's `relay-server/server.js` — it's already a WebSocket forwarder with token + session pattern, and adds the second-factor layer the OcuClaw `relayToken` design lacks.
+
+#### 1.5f — Daily operations
+
+Wrap the sequence in two shell scripts in `/Users/openclaw/bin/`:
+
+```bash
+# openclaw-start
+hdiutil attach ~/openclaw-workspace.sparseimage
+colima start
+cd ~/openclaw-stack && docker compose up -d
+launchctl load ~/Library/LaunchAgents/com.openclaw.enderfga.plist
+launchctl load ~/Library/LaunchAgents/com.openclaw.forwarder.plist
+
+# openclaw-stop
+launchctl unload ~/Library/LaunchAgents/com.openclaw.forwarder.plist
+launchctl unload ~/Library/LaunchAgents/com.openclaw.enderfga.plist
+cd ~/openclaw-stack && docker compose down
+hdiutil detach /Volumes/openclaw-workspace
+colima stop
+```
+
+#### 1.5g — Verify isolation
+
+Run from inside the container to confirm the blast radius is what you expect:
+
+```bash
+docker compose exec openclaw sh -c '
+  # Should NOT see your primary user files
+  ls /Users 2>&1 | head -5
+  # Should NOT have security (Keychain) binary
+  which security 2>&1 | head -1
+  # Should NOT have sudo
+  which sudo 2>&1 | head -1
+  # SHOULD be able to reach Enderfga on host
+  curl -m 2 -s http://host.docker.internal:3001/health
+'
+```
+
+Expected results: no file access to other users, no Keychain access, no sudo, Enderfga reachable over `host.docker.internal`. If any of these fail the expectation, investigate before proceeding.
+
+---
+
+### Phase 2 — OpenClaw install (runs inside the container)
+
+Config lives on the host at `/Users/openclaw/openclaw-stack/config/openclaw.json`, mounted read-only into the container at `/config/openclaw.json`:
 
 ```jsonc
 {
   "gateway": {
     "port": 18789,
-    "bind": "TAILSCALE_IP_HERE",   // 100.x.y.z — never 0.0.0.0
-    "auth": {
-      "token": "<generate: openssl rand -hex 32>"
-    }
+    "bind": "0.0.0.0",              // inside container only; host port is loopback
+    "auth": { "token": "<openssl rand -hex 32>" }
   },
   "memory": {
     "enabled": true,
-    "workspacePath": "~/.openclaw/workspace"
+    "workspacePath": "/workspace"   // mounted sparseimage
   },
   "agent": {
-    "model": "google/gemini-2.5-flash-lite",  // default router
+    "model": "google/gemini-2.5-flash-lite",
     "fallbackModel": "google/gemini-2.5-flash"
   },
   "providers": {
     "google": {
-      "apiKey": "<GEMINI_API_KEY_FROM_KEYCHAIN>"
+      "apiKeyFile": "/run/secrets/gemini_api_key"   // docker-compose secret
     }
   }
 }
 ```
 
-Do NOT put API keys in plaintext in this file. Use the macOS Keychain:
+Secrets flow:
 
 ```bash
-# Store Gemini key in Keychain, reference via env in the LaunchAgent plist
-security add-generic-password -a openclaw -s GEMINI_API_KEY -w "<your-key>"
-# Then in ~/Library/LaunchAgents/com.openclaw.gateway.plist, add:
-# <key>EnvironmentVariables</key>
-# <dict><key>GEMINI_API_KEY</key><string>$(security find-generic-password -a openclaw -s GEMINI_API_KEY -w)</string></dict>
+# As openclaw user, write the Gemini API key into the secrets file that docker-compose mounts
+echo -n "<your-gemini-key>" > ~/openclaw-stack/secrets/gemini_api_key.txt
+chmod 600 ~/openclaw-stack/secrets/gemini_api_key.txt
+chmod 600 ~/openclaw-stack/config/openclaw.json
 ```
 
-Protect config file:
+Pull and start:
+
 ```bash
-chmod 600 ~/.openclaw/openclaw.json
-chmod 700 ~/.openclaw/
+cd ~/openclaw-stack
+docker compose pull openclaw
+docker compose up -d openclaw
+docker compose logs -f openclaw       # verify startup
 ```
+
+Version pinning: resolve `openclaw/openclaw:<tag>` to an image digest (`docker inspect --format='{{.RepoDigests}}' ...`) and pin that in `docker-compose.yml` — tag-only pinning lets silent upstream re-pushes slip in.
 
 ---
 
@@ -189,33 +327,24 @@ chmod 700 ~/.openclaw/
 
 Mosyle already enforces the macOS Application Firewall (profile #26) with logging (#32), so we skip the firewall-on steps. The real hardening here is **defending against Mosyle's own read access** to the memory DB and secrets.
 
-**Memory DB encryption at rest (critical — mitigates Mosyle TCC Full Disk Access):**
+**Memory DB encryption at rest:**
 
-Mosyle's TCC profile grants the Mosyle agent Full Disk Access. Anything in plaintext under `~/.openclaw/` is readable by them. The mitigation is to store the memory DB on an **encrypted sparseimage** whose passphrase lives only in your personal password manager:
+Create an encrypted sparseimage as the `openclaw` user. Volume is bind-mounted into the container at `/workspace` by the compose file in Phase 1.5d.
 
 ```bash
-# Create a 10 GB encrypted sparseimage, passphrase from personal 1Password/Bitwarden
+# As the openclaw user:
 hdiutil create -size 10g -type SPARSE -fs APFS -encryption AES-256 \
-  -volname openclaw-workspace ~/openclaw-workspace.sparseimage
-
-# Mount it (prompts for passphrase)
-hdiutil attach ~/openclaw-workspace.sparseimage
+  -volname openclaw-workspace /Users/openclaw/openclaw-workspace.sparseimage
+hdiutil attach /Users/openclaw/openclaw-workspace.sparseimage
 # -> mounts at /Volumes/openclaw-workspace
-
-# Point OpenClaw at the mounted volume
-# Edit ~/.openclaw/openclaw.json:
-#   "memory": { "workspacePath": "/Volumes/openclaw-workspace" }
-
-# Unmount when not in use (e.g., overnight)
-hdiutil detach /Volumes/openclaw-workspace
 ```
 
-Mosyle will see the `.sparseimage` file but cannot decrypt it without your passphrase. The memory DB is readable only when mounted, which is only when OpenClaw is running. Trade-off: you either auto-mount on login (reduces protection — passphrase must live in Keychain, which Mosyle can potentially access) or mount manually each morning.
+Passphrase lives in your personal password manager, not in any Keychain. The sparseimage protects the memory DB at rest even if another user (or automated agent) on the machine reads the file. It is readable in plaintext only while mounted — mount at `openclaw-start`, unmount at `openclaw-stop` (Phase 1.5f).
 
 **Secrets handling:**
-- Store all provider API keys via `security add-generic-password ... -s <name>` — Keychain is not airtight against Mosyle but is still better than plaintext config.
-- Never put the raw API keys into `~/.openclaw/openclaw.json`. Reference them via environment variables injected from Keychain at daemon-start time.
-- The OpenClaw device token at `stateDir/ocuclaw-device-token.json` — keep this *inside* the encrypted sparseimage too if the plugin allows configurable `stateDir`.
+- Provider API keys go into `~/openclaw-stack/secrets/*.txt` (mode 0600) and are exposed to the container via `docker-compose` secrets, which mounts them at `/run/secrets/<name>` on a tmpfs — invisible to `docker inspect` and not captured in image layers.
+- Never put raw keys into `openclaw.json`. Use `"apiKeyFile": "/run/secrets/<name>"` references, which OpenClaw supports.
+- OpenClaw device token (`stateDir/ocuclaw-device-token.json`, written at first run by the OcuClaw plugin): keep `stateDir` inside the encrypted sparseimage so the token inherits the same at-rest protection as the memory DB.
 
 **OAuth discipline (mitigates corporate CA interception risk):**
 - Perform all OAuth flows (Gmail, Google Calendar, GHE, Vercel, Neon) over cellular tether or home wifi, **never** the `dart_secure` corporate network. The DA-root CA is trusted system-wide and *can* be used for TLS interception on corp wifi.
@@ -229,28 +358,68 @@ Mosyle will see the `.sparseimage` file but cannot decrypt it without your passp
 
 ---
 
-### Phase 4 — Enderfga Claude Code wrapper (1 day)
+### Phase 4 — Enderfga Claude Code wrapper (host sidecar, 1 day)
 
-This is the unlock for "deploy a Claude Code session from the glasses."
+Runs on the MBP host as the `openclaw` user, NOT inside the OpenClaw container. This keeps your Claude Max credentials outside the daemon's blast radius — a CVE in OpenClaw cannot directly exfiltrate your Max session token.
 
 ```bash
-git clone https://github.com/Enderfga/openclaw-claude-code ~/.openclaw/skills/claude-code-skill
-cd ~/.openclaw/skills/claude-code-skill
+# As the openclaw user:
+cd /Users/openclaw/openclaw-stack/enderfga
+git clone https://github.com/Enderfga/openclaw-claude-code .
 npm install
 
-# Verify your claude CLI is logged in with your Max account
-claude --version
-claude whoami   # should show your Max-subscribed account
+# Log in to Claude Code as this user — consumes one Max device slot
+claude login
+claude whoami         # confirm the Max account
 ```
 
-Register it as an OpenClaw skill per the repo's README. The wrapper exposes an OpenAI-compatible endpoint that OpenClaw can invoke; because it shells out to the local `claude` binary, all sessions run against your Max subscription — no Anthropic API billing.
+LaunchAgent at `/Users/openclaw/Library/LaunchAgents/com.openclaw.enderfga.plist`:
 
-Test end-to-end before wiring in the glasses:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.openclaw.enderfga</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/openclaw/openclaw-stack/enderfga/dist/server.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PORT</key><string>3001</string>
+    <key>HOST</key><string>127.0.0.1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/openclaw/openclaw-stack/enderfga/out.log</string>
+  <key>StandardErrorPath</key><string>/Users/openclaw/openclaw-stack/enderfga/err.log</string>
+</dict></plist>
 ```
-OpenClaw prompt → "Fix the lint error in the even-g2-claude relay-server"
-                → Claude Code session spawns in the even-g2-claude repo directory
-                → returns a PR-ready diff
+
+Load it:
+
+```bash
+launchctl load /Users/openclaw/Library/LaunchAgents/com.openclaw.enderfga.plist
+curl -s http://127.0.0.1:3001/health        # should return 200
 ```
+
+End-to-end flow:
+
+```
+OpenClaw container  →  HTTP POST http://host.docker.internal:3001/v1/...
+                    →  Enderfga on host (openclaw user)
+                    →  claude CLI  →  Max subscription
+                    →  session runs in a designated repo
+                    →  diff / output returned to OpenClaw
+```
+
+Blast radius of an Enderfga compromise (via its HTTP endpoint):
+- Attacker runs as `openclaw` user (no admin)
+- Can drain Max quota and execute Claude Code sessions in reachable repos
+- Cannot reach primary user's files, Keychain, or system files
+- Cannot persist beyond `openclaw` user's home
+
+Meaningfully smaller than either (a) running Enderfga inside the OpenClaw container, which puts Max credentials in the most-attacked surface, or (b) running it as your primary user, which exposes everything you own.
 
 ---
 
@@ -291,18 +460,62 @@ Track:
 
 ## 2. Risk Assessment
 
-Re-graded after the `sudo profiles show -all` audit (2026-04-18).
+Re-graded after the `sudo profiles show -all` audit (2026-04-18) and the containerization decision. Primary threat model for this host is **"OpenClaw compromise should not compromise the machine,"** not "employer should not see OpenClaw data" — owner has accepted the latter.
 
-### R1 — Employer read access to OpenClaw memory via TCC Full Disk Access (HIGH)
+### R1 — Employer read access to OpenClaw data (ACCEPTED by owner)
 
-Mosyle TCC configuration profiles (#10, #14, #15, #22, #30) pre-grant the Mosyle agent Full Disk Access. It can read anything at rest, including `~/.openclaw/workspace` (memory DB), `~/.openclaw/openclaw.json` (if it held plaintext keys), cached OAuth tokens, and shell history.
+Mosyle TCC profiles (#10/14/15/22/30) pre-grant the Mosyle agent Full Disk Access. Technically the employer can read anything at rest on this machine.
 
-**Exposure:** every personal email subject, every calendar event, every Neon query result that flows into OpenClaw's long-term memory is readable by the employer without notice.
+**Owner decision:** this risk is accepted. Work-adjacent integrations only are still recommended (GHE, Vercel, Neon dev branches, work Google Calendar) because they're already in-scope for the employer via normal channels. The encrypted sparseimage (Phase 3) is retained not to defeat the employer but to protect against any other process with disk read access (malware, a compromised Mosyle agent, future policy changes).
 
-**Mitigations (partial, not airtight):**
-- Memory DB on encrypted sparseimage with passphrase outside Keychain (Phase 3).
-- Scope integrations to work-adjacent only — **no Gmail, no personal iCalendar** on this machine. Calendar and GHE through work accounts are already in-scope for the employer anyway.
-- Treat the MBP trial as a **proof of concept for workflow**, not a production brain. Personal data migration to real personal hardware (Mac Mini, home server, personal VPS) is the fix, not a config change here.
+### R10 — OpenClaw compromise escalates to host (PRIMARY concern, MITIGATED by Phase 1.5)
+
+OpenClaw has an active CVE stream (CVE-2026-25253 RCE, CVE-2026-32922 priv-esc, ~156 advisories tracked). A successful exploit without containment gives attacker code execution as the running user, access to that user's files and Keychain, and the ability to install LaunchAgents for persistence.
+
+**Containment applied (Phase 1.5):**
+- Docker container with `cap_drop: [ALL]`, `no-new-privileges`, `mem_limit`, `cpus` — attacker is in a stripped Linux userland
+- Dedicated non-admin `openclaw` user — even a full container escape only reaches this user's home, not yours, not system
+- Ports bound to `127.0.0.1` — no remote reach without going through the host forwarder + Tailscale
+- Memory DB on encrypted sparseimage — write access limited to the one mounted volume
+- Enderfga wrapper as host sidecar — Claude Max credentials are in a separate process, not in the compromised daemon
+
+**Residual risk after containment:**
+- Container-to-VM escape (CVE in Docker/runc/kernel) → attacker in Colima VM. Significant barrier but not zero.
+- Colima-VM-to-macOS-host escape (hypervisor vulnerability) → extremely rare, effectively nation-state-tier.
+- Attacker can still: drain Gemini API quota, read/write the memory DB, call Enderfga's HTTP endpoint (and thus drain Max quota), issue MCP tool calls to Vercel/Neon/GHE with whatever scopes are configured.
+
+**Verdict:** containment reduces this from HIGH (uncontained) to LOW-MEDIUM. Weekly patching of the OpenClaw image keeps it there.
+
+### R2 — Employer TLS interception via installed CA roots (MEDIUM)
+
+Profiles #16 (`da-root.pem`) and #19 (`DA Root CA`) install Digital Artefacts CAs as trusted system-wide. On the `dart_secure` corp wifi, TLS interception is technically possible.
+
+**Exposure:** browser-based OAuth flows can be MITM'd, leaking refresh tokens for Vercel, GHE, Calendar, Neon.
+
+**Mitigation:** all OAuth flows over cellular tether or home wifi, never on `dart_secure`. Post-issuance API traffic is low-risk (cert-pinning in most SDKs).
+
+### R3 — MDM remote wipe on offboarding (HIGH, recoverable with prep)
+
+If the device is reclaimed, Mosyle wipes everything — including the encrypted sparseimage file. FileVault recovery key is escrowed to Mosyle (#8 payload[4]).
+
+**Mitigation:** nightly encrypted backup of the sparseimage to personal cloud storage:
+
+```bash
+# In openclaw user's crontab — nightly at 2am if sparseimage exists
+0 2 * * * /Users/openclaw/bin/openclaw-backup.sh
+```
+
+`openclaw-backup.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
+SRC=/Users/openclaw/openclaw-workspace.sparseimage
+[ -f "$SRC" ] || exit 0
+rclone copy "$SRC" personal-b2:openclaw-backups/ --transfers 1 --checksum
+echo "$(date -u) — backed up" >> /Users/openclaw/.openclaw/backup.log
+```
+
+Sparseimage passphrase and rclone config live in your **personal** 1Password / Bitwarden, not in any Keychain.
 
 ### R2 — Employer TLS interception via installed CA roots (MEDIUM)
 
@@ -376,13 +589,14 @@ See `oculaw-openclaw.md` for full CVE history. Pin ≥ 2026.2.25, subscribe to a
 
 | # | Risk | Rating |
 |---|---|---|
-| R1 | Employer TCC Full Disk Access → memory DB readable | **HIGH** |
-| R3 | MDM remote wipe on offboarding | **HIGH** |
-| R2 | TLS interception via corp CA on dart_secure wifi | MEDIUM |
+| R3 | MDM remote wipe on offboarding | **HIGH** (mitigated via nightly sparseimage backup) |
+| R10 | OpenClaw compromise escalating to host | LOW-MEDIUM (mitigated by Phase 1.5 containment) |
+| R2 | TLS interception via corp CA on `dart_secure` | MEDIUM |
 | R4 | Acceptable-use policy exposure | MEDIUM |
 | R5 | Forced OS updates / reboots | MEDIUM |
-| R6 | Tailscale blocked (audit suggests no, still worth Gate A) | MEDIUM |
-| R9 | OpenClaw CVEs | MEDIUM |
+| R6 | Tailscale blocked | MEDIUM (audit suggests unlikely) |
+| R9 | OpenClaw CVEs (beyond containment) | LOW-MEDIUM (weekly patching) |
+| R1 | Employer reads OpenClaw data | **ACCEPTED** by owner |
 | R7 | Hardware wear | LOW |
 | R8 | macOS EOL | LOW |
 
